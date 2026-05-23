@@ -38,12 +38,14 @@ impl TraceSink for MyRttSink {
 use execution_trace::{TraceSink, TraceEventSourceType};
 
 fn my_isr(sink: &mut impl TraceSink) {
-    sink.record_span_start("my_isr", TraceEventSourceType::Isr, 8, None).ok();
+    // at priority 8, with a payload of 3 (e.g., an iteration counter value or similar)
+    sink.record_span_start("my_isr", TraceEventSourceType::Isr, 8, Some(3)).ok();
     // ... work ...
     sink.record_span_end("my_isr", TraceEventSourceType::Isr, 8).ok();
 }
 
 fn ukf_step(sink: &mut impl TraceSink) {
+    // without a payload
     sink.record_marker("predict", None).ok();
     // ...
 }
