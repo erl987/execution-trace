@@ -8,6 +8,8 @@ bare-metal targets without a heap or OS. Events are serialised as length-delimit
 frames that you forward over any byte transport — RTT, UART, USB, or a ring buffer for
 post-mortem analysis.
 
+![screenshot_python_app_1.png](docs/screenshot_python_app_1.png)
+
 ## Quick start
 
 ### 1. Implement `TraceSink` for your transport
