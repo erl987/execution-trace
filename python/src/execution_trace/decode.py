@@ -92,7 +92,7 @@ class TraceEventBuffer:
         self._records: list[TraceEvent] = []
         self._markers: list[MarkerRecord] = []
 
-    def push(self, msg: tracing_pb2.TraceEvent) -> None:  # type: ignore[name-defined]
+    def push(self, msg: tracing_pb2.TraceEvent) -> None:
         """Process one decoded :class:`tracing_pb2.TraceEvent`.
 
         Args:

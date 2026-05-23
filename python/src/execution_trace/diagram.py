@@ -59,20 +59,17 @@ try:
         ColumnDataSource,
         CustomJS,
         CustomJSTickFormatter,
-        Div,
         FixedTicker,
         HoverTool,
-        LabelSet,
         PanTool,
         Range1d,
         RangeTool,
         ResetTool,
         SaveTool,
         Segment,
-        Toggle,
-        UIElement,
         WheelZoomTool,
     )
+    from bokeh.models import Div, LabelSet, Toggle, UIElement  # type: ignore[attr-defined]
     from bokeh.plotting import figure, output_file, save
 except ImportError as _err:
     raise ImportError(
@@ -355,16 +352,16 @@ def build_figure(
     x_hi = float(spans["end_us"].max())
     x_pad = max(1.0, (x_hi - x_lo) * 0.025)
 
-    p = figure(
+    p = figure(  # type: ignore[call-arg]
         width=1400,
         height=max(300, 90 + n * 54),
-        x_range=Range1d(x_lo - x_pad, x_hi + x_pad),
-        y_range=Range1d(-0.6, n - 0.4),
+        x_range=Range1d(start=x_lo - x_pad, end=x_hi + x_pad),
+        y_range=Range1d(start=-0.6, end=n - 0.4),
         tools="",
         toolbar_location="above",
         title=title,
     )
-    p.title.text_font_size = "14pt"
+    p.title.text_font_size = "14pt"  # type: ignore[union-attr]
     p.background_fill_color = "#fafafa"
     p.outline_line_color = None
 
@@ -399,7 +396,7 @@ def build_figure(
             fill_color="color",
             line_color=line_color, line_width=line_width,
             source=src, legend_label=legend_label,
-            **hatch_kw,
+            **hatch_kw,  # type: ignore[arg-type]
         )
         span_renderers.append(r)
 
@@ -496,7 +493,7 @@ def build_figure(
     p.ygrid.grid_line_dash = "dotted"
 
     span_hover = HoverTool(
-        renderers=span_renderers,
+        renderers=span_renderers,  # type: ignore[arg-type]
         tooltips=[
             ("", "<b>@name</b> (@kind)"),
             ("Start", "@start_fmt"),
@@ -515,7 +512,7 @@ def build_figure(
     tools = [wheel, box_zoom, pan, reset, save_tool, span_hover]
     if marker_renderers:
         tools.append(HoverTool(
-            renderers=marker_renderers,
+            renderers=marker_renderers,  # type: ignore[arg-type]
             tooltips=[
                 ("", "<b>@name</b> (marker)"),
                 ("Time", "@ts_fmt"),
@@ -559,11 +556,11 @@ def build_overview(
     x_hi = float(spans["end_us"].max())
     x_pad = max(1.0, (x_hi - x_lo) * 0.025)
 
-    ov = figure(
+    ov = figure(  # type: ignore[call-arg]
         width=main_p.width,
         height=80,
-        x_range=Range1d(x_lo - x_pad, x_hi + x_pad),
-        y_range=Range1d(-0.6, n - 0.4),
+        x_range=Range1d(start=x_lo - x_pad, end=x_hi + x_pad),
+        y_range=Range1d(start=-0.6, end=n - 0.4),
         toolbar_location=None,
         y_axis_type=None,
     )

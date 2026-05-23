@@ -65,7 +65,7 @@ def main() -> None:
     decode_tracing_stream(buf, tracker, event_buffer)
     event_buffer.flush_pending()
 
-    records = event_buffer.records + event_buffer.markers  # type: ignore[operator]
+    records = event_buffer.records + event_buffer.markers
     csv_path = write_tracing_csv(records, output_dir=output_dir)
 
     if csv_path is None:
