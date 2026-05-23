@@ -64,9 +64,7 @@ class TestTraceEventBuffer:
         msg2 = tracing_pb2.TraceEvent()
         msg2.name = "task_a"
         msg2.event_type = tracing_pb2.SPAN_END
-        msg2.source_type = tracing_pb2.TASK
         msg2.timestamp_ns = 2_000_000
-        msg2.priority = 4
         buf.push(msg2)
 
         records = buf.records
@@ -91,7 +89,6 @@ class TestTraceEventBuffer:
         msg2 = tracing_pb2.TraceEvent()
         msg2.name = "gyro_isr"
         msg2.event_type = tracing_pb2.SPAN_END
-        msg2.source_type = tracing_pb2.ISR
         msg2.timestamp_ns = 200
         buf.push(msg2)
 
@@ -102,7 +99,6 @@ class TestTraceEventBuffer:
         msg = tracing_pb2.TraceEvent()
         msg.name = "ghost"
         msg.event_type = tracing_pb2.SPAN_END
-        msg.source_type = tracing_pb2.TASK
         msg.timestamp_ns = 999
         with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
             buf.push(msg)
@@ -152,7 +148,6 @@ class TestTraceEventBuffer:
         msg2 = tracing_pb2.TraceEvent()
         msg2.name = "t"
         msg2.event_type = tracing_pb2.SPAN_END
-        msg2.source_type = tracing_pb2.TASK
         msg2.timestamp_ns = 1_000
         buf.push(msg2)
 

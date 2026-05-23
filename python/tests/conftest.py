@@ -54,7 +54,6 @@ def sample_span_end_frame() -> bytes:
         name="main_task",
         timestamp_ns=2_000_000,
         sequence=1,
-        priority=4,
     )
 
 

@@ -90,30 +90,23 @@ pub trait TraceSink {
 
     /// Records the end of a named execution span previously started with [`record_span_start`].
     ///
-    /// `source_name`, `source_type`, and `priority` must match the corresponding `record_span_start`
-    /// call so the host decoder can pair them correctly.
+    /// `source_name` must match the corresponding [`record_span_start`] call so the host decoder
+    /// can pair them correctly. Source type and priority are inferred from the start event.
     ///
     /// [`record_span_start`]: TraceSink::record_span_start
     ///
     /// # Errors
     /// Returns [`TracingError::MessageDropped`] if the name exceeds 32 bytes.
     /// Otherwise propagates whatever `try_send` returns.
-    fn record_span_end(
-        &mut self,
-        source_name: &'static str,
-        source_type: TraceEventSourceType,
-        priority: u8,
-    ) -> Result<(), TracingError> {
+    fn record_span_end(&mut self, source_name: &'static str) -> Result<(), TracingError> {
         let mut name: String<32> = String::new();
         name.push_str(source_name)
             .map_err(|_| TracingError::MessageDropped)?;
         self.try_send(TraceEvent {
             timestamp_ns: self.get_elapsed_nanoseconds(),
             name,
-            source_type,
             event_type: TraceEventType::SpanEnd,
             sequence: 0,
-            priority: u32::from(priority),
             ..Default::default()
         })
     }
@@ -216,8 +209,7 @@ mod tests {
     #[test]
     fn record_span_end_sets_span_end_event_type() {
         let mut sink = CaptureSink::new();
-        sink.record_span_end("main_task", TraceEventSourceType::Task, 4)
-            .unwrap();
+        sink.record_span_end("main_task").unwrap();
         assert_eq!(sink.messages[0].event_type, TraceEventType::SpanEnd);
     }
 
@@ -240,8 +232,7 @@ mod tests {
     #[test]
     fn record_span_end_has_no_deadline() {
         let mut sink = CaptureSink::new();
-        sink.record_span_end("main_task", TraceEventSourceType::Task, 4)
-            .unwrap();
+        sink.record_span_end("main_task").unwrap();
         assert_eq!(sink.messages[0].deadline_ms(), None);
     }
 
@@ -249,16 +240,6 @@ mod tests {
     fn record_span_start_sets_source_type_and_priority() {
         let mut sink = CaptureSink::new();
         sink.record_span_start("gyro_isr", TraceEventSourceType::Isr, 8, None)
-            .unwrap();
-        let msg = &sink.messages[0];
-        assert_eq!(msg.source_type, TraceEventSourceType::Isr);
-        assert_eq!(msg.priority, 8);
-    }
-
-    #[test]
-    fn record_span_end_sets_source_type_and_priority() {
-        let mut sink = CaptureSink::new();
-        sink.record_span_end("gyro_isr", TraceEventSourceType::Isr, 8)
             .unwrap();
         let msg = &sink.messages[0];
         assert_eq!(msg.source_type, TraceEventSourceType::Isr);
@@ -276,8 +257,7 @@ mod tests {
     #[test]
     fn record_span_end_uses_elapsed_nanoseconds_for_timestamp() {
         let mut sink = CaptureSink::with_timestamp(99_000_000);
-        sink.record_span_end("led_task", TraceEventSourceType::Task, 2)
-            .unwrap();
+        sink.record_span_end("led_task").unwrap();
         assert_eq!(sink.messages[0].timestamp_ns, 99_000_000);
     }
 
@@ -293,7 +273,7 @@ mod tests {
     #[test]
     fn record_span_end_name_too_long_returns_message_dropped() {
         let mut sink = CaptureSink::new();
-        let result = sink.record_span_end("this_name_is_way_too_long_for_limit", TraceEventSourceType::Task, 2);
+        let result = sink.record_span_end("this_name_is_way_too_long_for_limit");
         assert_eq!(result, Err(TracingError::MessageDropped));
         assert!(sink.messages.is_empty());
     }
@@ -306,7 +286,7 @@ mod tests {
 
     #[test]
     fn send_error_propagated_from_record_span_end() {
-        let result = ErrorSink.record_span_end("main_task", TraceEventSourceType::Task, 4);
+        let result = ErrorSink.record_span_end("main_task");
         assert_eq!(result, Err(TracingError::SendFailed));
     }
 
