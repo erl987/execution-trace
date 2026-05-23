@@ -83,7 +83,7 @@ longer names cause `record_*` to return [`TracingError::MessageDropped`] before 
 
 ## Host-side tooling
 
-The companion Python package `execution-traces` decodes the binary stream, matches span start/end pairs,
+The companion Python package `execution-trace` decodes the binary stream, matches span start/end pairs,
 and renders a zoomable Bokeh timing diagram as a standalone HTML file. The intermediate format is
 a CSV with columns `name`, `type`, `start_us`, `end_us`, `priority`, `deadline_us`, and `value`.
 
