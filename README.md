@@ -8,7 +8,7 @@ bare-metal targets without a heap or OS. Events are serialised as length-delimit
 frames that you forward over any byte transport — RTT, UART, USB, or a ring buffer for
 post-mortem analysis.
 
-![screenshot_python_app_1.png](docs/screenshot_python_app_1.png)
+![execution trace timing diagram](https://raw.githubusercontent.com/erl987/execution-trace/main/docs/screenshot_python_app_1.png)
 
 ## Quick start
 
