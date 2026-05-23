@@ -18,5 +18,6 @@ python/dist/
 .vscode/
 *.iml
 
-# Diagram output
+# Example output
+trace.bin
 diagram.html

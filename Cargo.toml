@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/erl987/execution-trace"
 keywords = ["embedded", "tracing", "no_std", "profiling", "rtos"]
 categories = ["development-tools::profiling", "embedded", "no-std"]
-include = ["/src/**", "/proto/**", "/build.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+include = ["/src/**", "/proto/**", "/build.rs", "/examples/simulate.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [lints.clippy]
 unwrap_used = "deny"
@@ -27,6 +27,10 @@ micropb = { version = "0.6.0", default-features = false, features = ["encode", "
 
 [build-dependencies]
 micropb-gen = "0.6.0"
+
+[[example]]
+name = "simulate"
+required-features = ["std"]
 
 [dev-dependencies]
 insta = "1"
