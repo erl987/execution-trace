@@ -106,7 +106,7 @@ Each frame is a standard protobuf length-delimited record:
 [ varint: payload_length ][ proto bytes: TraceEvent ]
 ```
 
-The protobuf schema lives in `crates/execution-trace/proto/tracing.proto` (sibling
+The protobuf schema lives in :file:`execution-trace/proto/tracing.proto` (sibling
 Rust crate in the same repository).
 
 ## Development

@@ -1,5 +1,5 @@
 ---
-source: crates/execution-trace/src/encode.rs
+source: execution-trace/src/encode.rs
 expression: "&buf[..n]"
 ---
 [
