@@ -97,6 +97,31 @@ The companion Python package `execution-trace` decodes the binary stream, matche
 and renders a zoomable Bokeh timing diagram as a standalone HTML file. The intermediate format is
 a CSV with columns `name`, `type`, `start_us`, `end_us`, `priority`, `deadline_us`, and `value`.
 
+## End-to-end example
+
+The `examples/` directory contains a self-contained simulation that demonstrates the full
+workflow without any hardware:
+
+```bash
+# 1. Install the Python package with diagram support
+pip install execution-trace[diagram]
+
+# 2. Simulate an embedded trace and write it to trace.bin
+cargo run --example simulate --features std
+
+# 3. Decode the binary trace and render an interactive HTML timing diagram
+python examples/visualize.py
+```
+
+`simulate` records two control-loop iterations — a `gyro_isr` (ISR, priority 8) and a
+`control_task` (task, priority 4) with `ukf_predict`/`ukf_update` markers — where the
+first iteration meets its deadline and the second misses it. `visualize.py` reads
+`trace.bin`, writes a temporary CSV, and produces `diagram.html` that you can open in any
+browser.
+
+Both scripts accept `--help` for available options (e.g. `--input`, `--output`, `--title`
+for `visualize.py`).
+
 ## `no_std` usage
 
 The crate is `no_std` by default. Enable the `std` feature for tests:
