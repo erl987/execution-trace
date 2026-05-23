@@ -15,6 +15,7 @@ post-mortem analysis.
 ### 1. Implement `TraceSink` for your transport
 
 ```rust
+# fn hardware_timer_ns() -> u64 { 0 }
 use execution_trace::{TraceSink, TracingError, TraceEvent};
 
 struct MyRttSink { /* ... */ }
@@ -56,27 +57,34 @@ fn ukf_step(sink: &mut impl TraceSink) {
 Use [`SequenceEncoder`] when encoding events manually so the host can detect dropped frames:
 
 ```rust
-use execution_trace::{SequenceEncoder, encode::MAX_TRACE_FRAME_SIZE};
+use execution_trace::{SequenceEncoder, TraceEvent, encode::MAX_TRACE_FRAME_SIZE};
 
+let event = TraceEvent::default();
 let mut enc = SequenceEncoder::new();
 let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
-let n = enc.encode(&event, &mut buf)?;
-transport.write(&buf[..n]);
+if let Ok(n) = enc.encode(&event, &mut buf) {
+    // forward buf[..n] over your transport (RTT, UART, USB, etc.)
+    let _ = &buf[..n];
+}
 ```
 
 ### 4. Decode on the host
 
 ```rust
-use execution_trace::encode::decode_trace_frame;
+# use execution_trace::{TraceEvent, SequenceEncoder, encode::MAX_TRACE_FRAME_SIZE};
+# let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
+# let n = SequenceEncoder::new().encode(&TraceEvent::default(), &mut buf).unwrap();
+# let raw_bytes = &buf[..n];
 
-let (event, consumed) = decode_trace_frame(&raw_bytes)?;
+use execution_trace::encode::decode_trace_frame;
+let (event, consumed) = decode_trace_frame(raw_bytes).unwrap();
 ```
 
 ## Wire format
 
 Each frame is a standard protobuf length-delimited record:
 
-```
+```text
 [ varint: payload byte count ][ protobuf-encoded TraceEvent ]
 ```
 
