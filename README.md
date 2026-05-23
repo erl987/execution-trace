@@ -97,7 +97,3 @@ The crate is `no_std` by default. Enable the `std` feature for tests:
 [dev-dependencies]
 execution-trace = { version = "0.1", features = ["std"] }
 ```
-
-[`SequenceEncoder`]: crate::SequenceEncoder
-[`MAX_TRACE_FRAME_SIZE`]: crate::encode::MAX_TRACE_FRAME_SIZE
-[`TracingError::MessageDropped`]: crate::TracingError::MessageDropped
