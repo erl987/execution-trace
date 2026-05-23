@@ -1,0 +1,15 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --features std
+      - run: cargo clippy --features std -- -D warnings
+      - run: cargo fmt --check

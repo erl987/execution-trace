@@ -1,0 +1,26 @@
+syntax = "proto3";
+package tracing;
+
+message TraceEvent {
+  uint64 timestamp_ns = 1;
+  string name = 2;
+  TraceEventSourceType source_type = 3;
+  TraceEventType event_type = 4;
+  uint32 sequence = 5;
+  uint32 priority = 6;
+  optional float deadline_ms = 7;
+  optional uint32 marker_value = 8;
+}
+
+enum TraceEventSourceType {
+  TRACE_EVENT_SOURCE_TYPE_UNSPECIFIED = 0;
+  ISR = 1;
+  TASK = 2;
+}
+
+enum TraceEventType {
+  TRACE_EVENT_TYPE_UNSPECIFIED = 0;
+  SPAN_START = 1;
+  SPAN_END = 2;
+  MARKER = 3;
+}

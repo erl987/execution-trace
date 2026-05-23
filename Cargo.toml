@@ -1,0 +1,31 @@
+[package]
+name = "execution-trace"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "no_std embedded execution tracing — transport-agnostic span/marker recording with protobuf framing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ralf-it/execution-trace"
+keywords = ["embedded", "tracing", "no_std", "profiling", "rtos"]
+categories = ["development-tools::profiling", "embedded", "no-std"]
+include = ["src/", "proto/", "build.rs", "Cargo.toml", "README.md"]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+undocumented_unsafe_blocks = "deny"
+panic = "deny"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+heapless = "0.9.2"
+micropb = { version = "0.6.0", default-features = false, features = ["encode", "decode", "container-heapless-0-9", "enable-64bit"] }
+
+[build-dependencies]
+micropb-gen = "0.6.0"
+
+[dev-dependencies]
+insta = "1"

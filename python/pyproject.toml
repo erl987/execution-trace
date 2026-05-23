@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "execution-trace"
+version = "0.1.0"
+description = "Decode and visualise no_std embedded execution traces over RTT or any byte transport"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.11"
+keywords = ["embedded", "tracing", "rtos", "profiling", "rtt"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Debuggers",
+    "Programming Language :: Python :: 3",
+]
+dependencies = ["protobuf>=5"]
+
+[project.optional-dependencies]
+diagram = ["pandas>=2", "bokeh>=3"]
+dev     = ["pytest>=8", "pytest-cov", "mypy>=1.10", "mypy-protobuf", "pandas>=2", "bokeh>=3"]
+
+[project.scripts]
+etrace-decode  = "execution_trace._cli.decode:main"
+etrace-diagram = "execution_trace._cli.diagram:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/execution_trace"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "--tb=short"
+
+[tool.mypy]
+strict            = true
+ignore_missing_imports = true
