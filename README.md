@@ -80,7 +80,7 @@ Each frame is a standard protobuf length-delimited record:
 [ varint: payload byte count ][ protobuf-encoded TraceEvent ]
 ```
 
-Maximum frame size is [`MAX_TRACE_FRAME_SIZE`] (128 bytes). Name strings are capped at 32 bytes;
+Maximum frame size is [`encode::MAX_TRACE_FRAME_SIZE`] (128 bytes). Name strings are capped at 32 bytes;
 longer names cause `record_*` to return [`TracingError::MessageDropped`] before sending.
 
 ## Host-side tooling
