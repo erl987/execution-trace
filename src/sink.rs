@@ -54,8 +54,8 @@ pub trait TraceSink {
     ///   [`TracingError::MessageDropped`] immediately.
     /// - `source_type`: whether the caller is an [`Isr`] or a [`Task`].
     /// - `priority`: scheduler priority (e.g. RTIC task priority 1–9).
-    /// - `deadline_ms`: optional absolute deadline; enables missed-deadline highlighting in the
-    ///   diagram.
+    /// - `deadline_ms`: optional deadline duration in milliseconds relative to activation time;
+    ///   enables missed-deadline highlighting in the diagram.
     ///
     /// [`Isr`]: TraceEventSourceType::Isr
     /// [`Task`]: TraceEventSourceType::Task

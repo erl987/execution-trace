@@ -110,12 +110,13 @@ class TraceEventBuffer:
                 return
             start_ns, source_type, priority, deadline_ms = self._pending.pop(name)
             type_str = "isr" if source_type == tracing_pb2.ISR else "task"
-            deadline_us = deadline_ms * 1_000.0 if deadline_ms is not None else None
+            start_us = start_ns / 1_000.0
+            deadline_us = start_us + deadline_ms * 1_000.0 if deadline_ms is not None else None
             self._records.append(
                 TraceEvent(
                     name=name,
                     type=type_str,
-                    start_us=start_ns / 1_000.0,
+                    start_us=start_us,
                     end_us=msg.timestamp_ns / 1_000.0,
                     priority=priority,
                     deadline_us=deadline_us,

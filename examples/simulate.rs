@@ -58,18 +58,18 @@ fn main() -> std::io::Result<()> {
     //
     //  0.0 ms   gyro_isr  START  (ISR, priority 8)
     //  0.4 ms   gyro_isr  END
-    //  1.0 ms   control_task START  (TASK, priority 4, deadline 10 ms)
+    //  1.0 ms   control_task START  (TASK, priority 4, deadline budget 10 ms)
     //  2.0 ms   ukf_predict MARKER
     //  3.0 ms   gyro_isr  START  (second activation)
     //  3.4 ms   gyro_isr  END
     //  4.5 ms   ukf_update  MARKER  (value = iteration counter)
-    //  7.0 ms   control_task END
+    //  7.0 ms   control_task END                         ← meets deadline (7 ms < 1+10 ms)
     // 10.0 ms   gyro_isr  START  (third activation, second loop)
     // 10.4 ms   gyro_isr  END
-    // 11.0 ms   control_task START
+    // 11.0 ms   control_task START  (deadline budget 10 ms)
     // 12.0 ms   ukf_predict MARKER
     // 13.5 ms   ukf_update  MARKER  (value = 2)
-    // 18.5 ms   control_task END
+    // 18.5 ms   control_task END                         ← misses deadline (18.5 ms > 11+7.0 ms)
 
     let ms = 1_000_000u64; // nanoseconds per millisecond
 
@@ -109,7 +109,7 @@ fn main() -> std::io::Result<()> {
     sink.record_span_end("gyro_isr").ok();
 
     sink.tick_ns = 11 * ms;
-    sink.record_span_start("control_task", TraceEventSourceType::Task, 4, Some(10.0))
+    sink.record_span_start("control_task", TraceEventSourceType::Task, 4, Some(7.0))
         .ok();
 
     sink.tick_ns = 12 * ms;

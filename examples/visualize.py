@@ -31,9 +31,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--input",
-        default="trace.bin",
+        default="../trace.bin",
         metavar="FILE",
-        help="Binary trace file produced by the 'simulate' Rust example (default: trace.bin)",
+        help="Binary trace file produced by the 'simulate' Rust example (default: ../trace.bin)",
     )
     parser.add_argument(
         "--output",
