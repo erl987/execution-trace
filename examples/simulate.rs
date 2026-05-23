@@ -124,11 +124,18 @@ fn main() -> std::io::Result<()> {
     // --- Write encoded frames to trace.bin ---
     let bytes = sink.into_bytes();
     std::fs::write("trace.bin", &bytes)?;
-    println!("Wrote {} bytes ({} frames) to trace.bin", bytes.len(), count_frames(&bytes));
+    println!(
+        "Wrote {} bytes ({} frames) to trace.bin",
+        bytes.len(),
+        count_frames(&bytes)
+    );
 
     // --- Decode and print each event (round-trip verification) ---
     println!("\nDecoded events:");
-    println!("{:<6} {:<14} {:<12} {:<10} {:<8} {}", "seq", "name", "type", "source", "ts_ms", "extras");
+    println!(
+        "{:<6} {:<14} {:<12} {:<10} {:<8} {}",
+        "seq", "name", "type", "source", "ts_ms", "extras"
+    );
     println!("{}", "-".repeat(72));
     let mut pos = 0;
     while pos < bytes.len() {

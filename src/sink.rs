@@ -264,8 +264,12 @@ mod tests {
     #[test]
     fn record_span_start_name_too_long_returns_message_dropped() {
         let mut sink = CaptureSink::new();
-        let result =
-            sink.record_span_start("this_name_is_way_too_long_for_limit", TraceEventSourceType::Task, 2, None);
+        let result = sink.record_span_start(
+            "this_name_is_way_too_long_for_limit",
+            TraceEventSourceType::Task,
+            2,
+            None,
+        );
         assert_eq!(result, Err(TracingError::MessageDropped));
         assert!(sink.messages.is_empty());
     }
