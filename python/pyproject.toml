@@ -6,7 +6,8 @@ build-backend = "hatchling.build"
 name = "execution-trace"
 version = "0.1.0"
 description = "Decode and visualise no_std embedded execution traces over RTT or any byte transport"
-license = { text = "MIT OR Apache-2.0" }
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 requires-python = ">=3.11"
 keywords = ["embedded", "tracing", "rtos", "profiling", "rtt"]
 classifiers = [

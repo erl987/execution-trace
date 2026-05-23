@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ralf-it/execution-trace"
 keywords = ["embedded", "tracing", "no_std", "profiling", "rtos"]
 categories = ["development-tools::profiling", "embedded", "no-std"]
-include = ["src/", "proto/", "build.rs", "Cargo.toml", "README.md"]
+include = ["src/", "proto/", "build.rs", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [lints.clippy]
 unwrap_used = "deny"
