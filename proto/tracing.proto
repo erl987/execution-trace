@@ -8,7 +8,7 @@ message TraceEvent {
   TraceEventType event_type = 4;
   uint32 sequence = 5;
   uint32 priority = 6;
-  optional float deadline_ms = 7;
+  optional float relative_deadline_ms = 7;
   optional uint32 marker_value = 8;
 }
 

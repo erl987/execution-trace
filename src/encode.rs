@@ -157,8 +157,8 @@ fn build_proto_message(msg: &TraceEvent, sequence: u32) -> TraceEvent {
         priority: msg.priority,
         ..Default::default()
     };
-    if let Some(&dl) = msg.r#deadline_ms() {
-        out.set_deadline_ms(dl);
+    if let Some(&dl) = msg.r#relative_deadline_ms() {
+        out.set_relative_deadline_ms(dl);
     }
     if let Some(&v) = msg.marker_value() {
         out.set_marker_value(v);
@@ -189,7 +189,7 @@ mod tests {
 
     fn make_span_start_with_deadline() -> TraceEvent {
         let mut msg = make_span_start();
-        msg.set_deadline_ms(0.5);
+        msg.set_relative_deadline_ms(0.5);
         msg
     }
 
@@ -437,7 +437,7 @@ mod tests {
     fn round_trip_span_start_with_deadline_preserves_deadline() {
         let original = make_span_start_with_deadline();
         let decoded = round_trip(&original, 0);
-        assert_eq!(decoded.deadline_ms(), Some(&0.5_f32));
+        assert_eq!(decoded.relative_deadline_ms(), Some(&0.5_f32));
     }
 
     #[test]

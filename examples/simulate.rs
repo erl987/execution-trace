@@ -58,7 +58,7 @@ fn main() -> std::io::Result<()> {
     //
     //  0.0 ms   gyro_isr  START  (ISR, priority 8)
     //  0.4 ms   gyro_isr  END
-    //  1.0 ms   control_task START  (TASK, priority 4, deadline budget 10 ms)
+    //  1.0 ms   control_task START  (TASK, priority 4, relative deadline 10 ms)
     //  2.0 ms   ukf_predict MARKER
     //  3.0 ms   gyro_isr  START  (second activation)
     //  3.4 ms   gyro_isr  END
@@ -66,7 +66,7 @@ fn main() -> std::io::Result<()> {
     //  7.0 ms   control_task END                         ← meets deadline (7 ms < 1+10 ms)
     // 10.0 ms   gyro_isr  START  (third activation, second loop)
     // 10.4 ms   gyro_isr  END
-    // 11.0 ms   control_task START  (deadline budget 10 ms)
+    // 11.0 ms   control_task START  (relative deadline 7 ms)
     // 12.0 ms   ukf_predict MARKER
     // 13.5 ms   ukf_update  MARKER  (value = 2)
     // 18.5 ms   control_task END                         ← misses deadline (18.5 ms > 11+7.0 ms)
@@ -145,8 +145,8 @@ fn main() -> std::io::Result<()> {
                 let event_type = event_type_label(event.event_type);
                 let source = source_type_label(event.source_type);
                 let mut extras = String::new();
-                if let Some(dl) = event.deadline_ms() {
-                    extras.push_str(&format!("deadline={dl:.1}ms "));
+                if let Some(dl) = event.relative_deadline_ms() {
+                    extras.push_str(&format!("rel_deadline={dl:.1}ms "));
                 }
                 if let Some(v) = event.marker_value() {
                     extras.push_str(&format!("value={v}"));

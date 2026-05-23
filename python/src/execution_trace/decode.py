@@ -87,7 +87,7 @@ class TraceEventBuffer:
     """
 
     def __init__(self) -> None:
-        # name → (timestamp_ns, source_type, priority, deadline_ms)
+        # name → (timestamp_ns, source_type, priority, relative_deadline_ms)
         self._pending: dict[str, tuple[int, int, int, Optional[float]]] = {}
         self._records: list[TraceEvent] = []
         self._markers: list[MarkerRecord] = []
@@ -102,16 +102,16 @@ class TraceEventBuffer:
         if msg.event_type == tracing_pb2.SPAN_START:
             if name in self._pending:
                 logger.warning("Tracing: duplicate START for '%s' — discarding previous", name)
-            deadline_ms = msg.deadline_ms if msg.HasField("deadline_ms") else None
-            self._pending[name] = (msg.timestamp_ns, msg.source_type, int(msg.priority), deadline_ms)
+            relative_deadline_ms = msg.relative_deadline_ms if msg.HasField("relative_deadline_ms") else None
+            self._pending[name] = (msg.timestamp_ns, msg.source_type, int(msg.priority), relative_deadline_ms)
         elif msg.event_type == tracing_pb2.SPAN_END:
             if name not in self._pending:
                 logger.warning("Tracing: END for '%s' with no matching START — discarding", name)
                 return
-            start_ns, source_type, priority, deadline_ms = self._pending.pop(name)
+            start_ns, source_type, priority, relative_deadline_ms = self._pending.pop(name)
             type_str = "isr" if source_type == tracing_pb2.ISR else "task"
             start_us = start_ns / 1_000.0
-            deadline_us = start_us + deadline_ms * 1_000.0 if deadline_ms is not None else None
+            deadline_us = start_us + relative_deadline_ms * 1_000.0 if relative_deadline_ms is not None else None
             self._records.append(
                 TraceEvent(
                     name=name,

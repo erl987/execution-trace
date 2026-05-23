@@ -28,7 +28,7 @@ def _make_frame(
     timestamp_ns: int,
     sequence: int = 0,
     priority: int = 0,
-    deadline_ms: float | None = None,
+    relative_deadline_ms: float | None = None,
     marker_value: int | None = None,
 ) -> bytes:
     msg = tracing_pb2.TraceEvent()
@@ -38,8 +38,8 @@ def _make_frame(
     msg.event_type = event_type
     msg.sequence = sequence
     msg.priority = priority
-    if deadline_ms is not None:
-        msg.deadline_ms = deadline_ms
+    if relative_deadline_ms is not None:
+        msg.relative_deadline_ms = relative_deadline_ms
     if marker_value is not None:
         msg.marker_value = marker_value
     raw = msg.SerializeToString()
@@ -135,14 +135,14 @@ class TestTraceEventBuffer:
         buf.push(msg)
         assert buf.markers[0].value is None
 
-    def test_deadline_ms_converted_to_us(self):
+    def test_relative_deadline_ms_converted_to_us(self):
         buf = TraceEventBuffer()
         msg = tracing_pb2.TraceEvent()
         msg.name = "t"
         msg.event_type = tracing_pb2.SPAN_START
         msg.source_type = tracing_pb2.TASK
         msg.timestamp_ns = 0
-        msg.deadline_ms = 2.5
+        msg.relative_deadline_ms = 2.5
         buf.push(msg)
 
         msg2 = tracing_pb2.TraceEvent()

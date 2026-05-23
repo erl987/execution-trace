@@ -38,8 +38,8 @@ impl TraceSink for MyRttSink {
 use execution_trace::{TraceSink, TraceEventSourceType};
 
 fn my_isr(sink: &mut impl TraceSink) {
-    // at priority 8, with a deadline of 10 ms
-    sink.record_span_start("my_isr", TraceEventSourceType::Isr, 8, Some(10)).ok();
+    // at priority 8, with a relative deadline of 10 ms from activation
+    sink.record_span_start("my_isr", TraceEventSourceType::Isr, 8, Some(10.0)).ok();
     // ... work ...
     sink.record_span_end("my_isr").ok();
 }

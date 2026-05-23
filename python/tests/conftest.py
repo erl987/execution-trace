@@ -13,7 +13,7 @@ def _make_frame(
     timestamp_ns: int,
     sequence: int = 0,
     priority: int = 0,
-    deadline_ms: float | None = None,
+    relative_deadline_ms: float | None = None,
     marker_value: int | None = None,
 ) -> bytes:
     """Encode a single TraceEvent as a length-delimited protobuf frame."""
@@ -24,8 +24,8 @@ def _make_frame(
     msg.event_type = event_type
     msg.sequence = sequence
     msg.priority = priority
-    if deadline_ms is not None:
-        msg.deadline_ms = deadline_ms
+    if relative_deadline_ms is not None:
+        msg.relative_deadline_ms = relative_deadline_ms
     if marker_value is not None:
         msg.marker_value = marker_value
     raw = msg.SerializeToString()

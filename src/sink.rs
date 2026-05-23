@@ -54,8 +54,8 @@ pub trait TraceSink {
     ///   [`TracingError::MessageDropped`] immediately.
     /// - `source_type`: whether the caller is an [`Isr`] or a [`Task`].
     /// - `priority`: scheduler priority (e.g. RTIC task priority 1–9).
-    /// - `deadline_ms`: optional deadline duration in milliseconds relative to activation time;
-    ///   enables missed-deadline highlighting in the diagram.
+    /// - `relative_deadline_ms`: optional deadline duration in milliseconds relative to activation
+    ///   time; enables missed-deadline highlighting in the diagram.
     ///
     /// [`Isr`]: TraceEventSourceType::Isr
     /// [`Task`]: TraceEventSourceType::Task
@@ -68,7 +68,7 @@ pub trait TraceSink {
         source_name: &'static str,
         source_type: TraceEventSourceType,
         priority: u8,
-        deadline_ms: Option<f32>,
+        relative_deadline_ms: Option<f32>,
     ) -> Result<(), TracingError> {
         let mut name: String<32> = String::new();
         name.push_str(source_name)
@@ -82,8 +82,8 @@ pub trait TraceSink {
             priority: u32::from(priority),
             ..Default::default()
         };
-        if let Some(dl) = deadline_ms {
-            msg.set_deadline_ms(dl);
+        if let Some(dl) = relative_deadline_ms {
+            msg.set_relative_deadline_ms(dl);
         }
         self.try_send(msg)
     }
@@ -218,7 +218,7 @@ mod tests {
         let mut sink = CaptureSink::new();
         sink.record_span_start("main_task", TraceEventSourceType::Task, 4, Some(0.5))
             .unwrap();
-        assert_eq!(sink.messages[0].deadline_ms(), Some(&0.5_f32));
+        assert_eq!(sink.messages[0].relative_deadline_ms(), Some(&0.5_f32));
     }
 
     #[test]
@@ -226,14 +226,14 @@ mod tests {
         let mut sink = CaptureSink::new();
         sink.record_span_start("gyro_isr", TraceEventSourceType::Isr, 8, None)
             .unwrap();
-        assert_eq!(sink.messages[0].deadline_ms(), None);
+        assert_eq!(sink.messages[0].relative_deadline_ms(), None);
     }
 
     #[test]
     fn record_span_end_has_no_deadline() {
         let mut sink = CaptureSink::new();
         sink.record_span_end("main_task").unwrap();
-        assert_eq!(sink.messages[0].deadline_ms(), None);
+        assert_eq!(sink.messages[0].relative_deadline_ms(), None);
     }
 
     #[test]
@@ -340,7 +340,7 @@ mod tests {
     fn record_marker_has_no_deadline() {
         let mut sink = CaptureSink::new();
         sink.record_marker("checkpoint", Some(1)).unwrap();
-        assert_eq!(sink.messages[0].deadline_ms(), None);
+        assert_eq!(sink.messages[0].relative_deadline_ms(), None);
     }
 
     #[test]
