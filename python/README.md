@@ -7,6 +7,8 @@ length-delimited protobuf frames for task activations, ISR entries, and point-in
 markers. This Python package decodes those frames on the host and produces interactive
 HTML timing diagrams.
 
+![screenshot_python_app_1.png](../docs/screenshot_python_app_1.png)
+
 ## Installation
 
 ```bash
