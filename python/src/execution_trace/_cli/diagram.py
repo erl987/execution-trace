@@ -13,8 +13,8 @@ Input CSV columns (as written by ``etrace-decode`` or :func:`write_tracing_csv`)
 Usage::
 
     etrace-diagram
-    etrace-diagram trace.csv
-    etrace-diagram trace.csv --output diagram.html --title "My Trace"
+    etrace-diagram trace_latest.csv
+    etrace-diagram trace_latest.csv --output diagram.html --title "My Trace"
 """
 
 import argparse
@@ -42,8 +42,8 @@ def main() -> None:
     ap.add_argument(
         "csv",
         nargs="?",
-        default="trace.csv",
-        help="Tracing data CSV  (default: trace.csv)",
+        default="trace_latest.csv",
+        help="Tracing data CSV  (default: trace_latest.csv)",
     )
     ap.add_argument(
         "--output",
