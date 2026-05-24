@@ -22,7 +22,6 @@ Types that only move pre-built events (e.g., a downstream serialiser driven by a
 implement `TraceTransport` alone. Types that also originate recordings implement both.
 
 ```rust
-# fn hardware_timer_ns() -> u64 { 0 }
 use execution_trace::{TraceTransport, TraceSink, TracingError, TraceEvent};
 
 struct MyRttSink { /* ... */ }
@@ -36,7 +35,7 @@ impl TraceTransport for MyRttSink {
 
 impl TraceSink for MyRttSink {
     fn get_elapsed_nanoseconds(&self) -> u64 {
-        hardware_timer_ns()
+        0 // replace with your hardware timer
     }
 }
 ```
@@ -67,16 +66,16 @@ Use [`SequenceEncoder`] when encoding events manually so the host can detect dro
 ```rust
 use execution_trace::{SequenceEncoder, SourceType, TraceEvent, encode::MAX_TRACE_FRAME_SIZE};
 
-# let mut name = heapless::String::<32>::new();
-# name.push_str("my_task").unwrap();
-# let event = TraceEvent::SpanStart {
-#    timestamp_ns: 0,
-#    name,
-#    source_type: SourceType::Task,
-#    sequence: 0,
-#    priority: 4,
-#    relative_deadline_ms: None,
-#};
+let mut name = heapless::String::<32>::new();
+name.push_str("my_task").unwrap();
+let event = TraceEvent::SpanStart {
+    timestamp_ns: 0,
+    name,
+    source_type: SourceType::Task,
+    sequence: 0,
+    priority: 4,
+    relative_deadline_ms: None,
+};
 let mut enc = SequenceEncoder::new();
 let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
 if let Ok(n) = enc.encode(&event, &mut buf) {
@@ -87,16 +86,10 @@ if let Ok(n) = enc.encode(&event, &mut buf) {
 
 ### 4. Decode on the host
 
-```rust
-# use execution_trace::{SourceType, TraceEvent, SequenceEncoder, encode::MAX_TRACE_FRAME_SIZE};
-# let mut name = heapless::String::<32>::new();
-# name.push_str("my_task").unwrap();
-# let event = TraceEvent::SpanStart { timestamp_ns: 0, name, source_type: SourceType::Task, sequence: 0, priority: 4, relative_deadline_ms: None };
-# let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
-# let n = SequenceEncoder::new().encode(&event, &mut buf).unwrap();
-# let raw_bytes = &buf[..n];
-
+```rust,ignore
 use execution_trace::encode::decode_trace_frame;
+
+// raw_bytes arrives from your transport (RTT, UART, file, etc.)
 let (event, consumed) = decode_trace_frame(raw_bytes).unwrap();
 ```
 
