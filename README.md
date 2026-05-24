@@ -1,5 +1,3 @@
-# execution-trace
-
 `no_std` embedded execution tracing with transport-agnostic span/marker recording and protobuf
 wire framing.
 
