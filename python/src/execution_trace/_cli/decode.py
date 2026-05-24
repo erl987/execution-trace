@@ -1,7 +1,7 @@
 """etrace-decode — decode a raw binary execution-trace file to CSV.
 
 The binary file must contain length-delimited protobuf frames as produced by
-the ``execution-trace`` Rust crate (each frame is a varint-prefixed
+the ``execution_trace`` Rust crate (each frame is a varint-prefixed
 serialised ``TraceEvent`` protobuf).
 
 Usage::
