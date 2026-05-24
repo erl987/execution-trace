@@ -7,7 +7,7 @@ runs on your firmware and emits length-delimited protobuf frames for task activa
 ISR entries, and point-in-time markers. This Python package decodes those frames on the 
 host and produces interactive HTML timing diagrams.
 
-![screenshot_python_app_1.png](../docs/screenshot_python_app_1.png)
+![execution trace timing diagram](https://raw.githubusercontent.com/erl987/execution-trace/main/docs/screenshot_python_app_1.png)
 
 ## Installation
 
