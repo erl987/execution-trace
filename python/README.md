@@ -2,7 +2,7 @@
 
 Decode and visualise **no_std embedded execution traces** over RTT or any byte transport.
 
-The companion Rust crate (`execution-trace`) runs on your firmware and emits
+The companion Rust crate (`execution_trace`) runs on your firmware and emits
 length-delimited protobuf frames for task activations, ISR entries, and point-in-time
 markers. This Python package decodes those frames on the host and produces interactive
 HTML timing diagrams.
