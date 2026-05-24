@@ -44,11 +44,11 @@ impl TraceSink for MyRttSink {
 ### 2. Record spans and markers
 
 ```rust
-use execution_trace::{TraceSink, TraceEventSourceType};
+use execution_trace::{TraceSink, SourceType};
 
 fn my_isr(sink: &mut impl TraceSink) {
     // at priority 8, with a relative deadline of 10 ms from activation
-    sink.record_span_start("my_isr", TraceEventSourceType::Isr, 8, Some(10.0)).ok();
+    sink.record_span_start("my_isr", SourceType::Isr, 8, Some(10.0)).ok();
     // ... work ...
     sink.record_span_end("my_isr").ok();
 }
@@ -65,9 +65,18 @@ fn ukf_step(sink: &mut impl TraceSink) {
 Use [`SequenceEncoder`] when encoding events manually so the host can detect dropped frames:
 
 ```rust
-use execution_trace::{SequenceEncoder, TraceEvent, encode::MAX_TRACE_FRAME_SIZE};
+use execution_trace::{SequenceEncoder, SourceType, TraceEvent, encode::MAX_TRACE_FRAME_SIZE};
 
-let event = TraceEvent::default();
+# let mut name = heapless::String::<32>::new();
+# name.push_str("my_task").unwrap();
+# let event = TraceEvent::SpanStart {
+#    timestamp_ns: 0,
+#    name,
+#    source_type: SourceType::Task,
+#    sequence: 0,
+#    priority: 4,
+#    relative_deadline_ms: None,
+#};
 let mut enc = SequenceEncoder::new();
 let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
 if let Ok(n) = enc.encode(&event, &mut buf) {
@@ -79,9 +88,12 @@ if let Ok(n) = enc.encode(&event, &mut buf) {
 ### 4. Decode on the host
 
 ```rust
-# use execution_trace::{TraceEvent, SequenceEncoder, encode::MAX_TRACE_FRAME_SIZE};
+# use execution_trace::{SourceType, TraceEvent, SequenceEncoder, encode::MAX_TRACE_FRAME_SIZE};
+# let mut name = heapless::String::<32>::new();
+# name.push_str("my_task").unwrap();
+# let event = TraceEvent::SpanStart { timestamp_ns: 0, name, source_type: SourceType::Task, sequence: 0, priority: 4, relative_deadline_ms: None };
 # let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
-# let n = SequenceEncoder::new().encode(&TraceEvent::default(), &mut buf).unwrap();
+# let n = SequenceEncoder::new().encode(&event, &mut buf).unwrap();
 # let raw_bytes = &buf[..n];
 
 use execution_trace::encode::decode_trace_frame;

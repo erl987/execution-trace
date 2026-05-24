@@ -1,4 +1,4 @@
-use crate::{TraceEvent, TraceEventSourceType, TraceEventType};
+use crate::{SourceType, TraceEvent};
 use heapless::String;
 
 /// Errors that a [`TraceTransport`] or [`TraceSink`] can return.
@@ -63,8 +63,8 @@ pub trait TraceSink: TraceTransport {
     /// - `relative_deadline_ms`: optional deadline duration in milliseconds relative to activation
     ///   time; enables missed-deadline highlighting in the diagram.
     ///
-    /// [`Isr`]: TraceEventSourceType::Isr
-    /// [`Task`]: TraceEventSourceType::Task
+    /// [`Isr`]: SourceType::Isr
+    /// [`Task`]: SourceType::Task
     ///
     /// # Errors
     /// Returns [`TracingError::MessageDropped`] if the name exceeds 32 bytes.
@@ -72,32 +72,27 @@ pub trait TraceSink: TraceTransport {
     fn record_span_start(
         &mut self,
         source_name: &'static str,
-        source_type: TraceEventSourceType,
+        source_type: SourceType,
         priority: u8,
         relative_deadline_ms: Option<f32>,
     ) -> Result<(), TracingError> {
         let mut name: String<32> = String::new();
         name.push_str(source_name)
             .map_err(|_| TracingError::MessageDropped)?;
-        let mut msg = TraceEvent {
+        self.write_event(TraceEvent::SpanStart {
             timestamp_ns: self.get_elapsed_nanoseconds(),
             name,
             source_type,
-            event_type: TraceEventType::SpanStart,
             sequence: 0,
             priority: u32::from(priority),
-            ..Default::default()
-        };
-        if let Some(dl) = relative_deadline_ms {
-            msg.set_relative_deadline_ms(dl);
-        }
-        self.write_event(msg)
+            relative_deadline_ms,
+        })
     }
 
     /// Records the end of a named execution span previously started with [`record_span_start`].
     ///
     /// `source_name` must match the corresponding [`record_span_start`] call so the host decoder
-    /// can pair them correctly. Source type and priority are inferred from the start event.
+    /// can pair them correctly.
     ///
     /// [`record_span_start`]: TraceSink::record_span_start
     ///
@@ -108,12 +103,10 @@ pub trait TraceSink: TraceTransport {
         let mut name: String<32> = String::new();
         name.push_str(source_name)
             .map_err(|_| TracingError::MessageDropped)?;
-        self.write_event(TraceEvent {
+        self.write_event(TraceEvent::SpanEnd {
             timestamp_ns: self.get_elapsed_nanoseconds(),
             name,
-            event_type: TraceEventType::SpanEnd,
             sequence: 0,
-            ..Default::default()
         })
     }
 
@@ -136,16 +129,12 @@ pub trait TraceSink: TraceTransport {
         let mut name: String<32> = String::new();
         name.push_str(label)
             .map_err(|_| TracingError::MessageDropped)?;
-        let mut msg = TraceEvent {
+        self.write_event(TraceEvent::Marker {
             timestamp_ns: self.get_elapsed_nanoseconds(),
             name,
-            event_type: TraceEventType::Marker,
-            ..Default::default()
-        };
-        if let Some(v) = value {
-            msg.set_marker_value(v);
-        }
-        self.write_event(msg)
+            sequence: 0,
+            marker_value: value,
+        })
     }
 }
 
@@ -221,64 +210,91 @@ mod tests {
     #[test]
     fn record_span_start_sets_span_start_event_type() {
         let mut sink = CaptureSink::new();
-        sink.record_span_start("main_task", TraceEventSourceType::Task, 4, None)
+        sink.record_span_start("main_task", SourceType::Task, 4, None)
             .unwrap();
-        assert_eq!(sink.messages[0].event_type, TraceEventType::SpanStart);
+        assert!(matches!(sink.messages[0], TraceEvent::SpanStart { .. }));
     }
 
     #[test]
     fn record_span_end_sets_span_end_event_type() {
         let mut sink = CaptureSink::new();
         sink.record_span_end("main_task").unwrap();
-        assert_eq!(sink.messages[0].event_type, TraceEventType::SpanEnd);
+        assert!(matches!(sink.messages[0], TraceEvent::SpanEnd { .. }));
     }
 
     #[test]
     fn record_span_start_with_deadline_sets_deadline() {
         let mut sink = CaptureSink::new();
-        sink.record_span_start("main_task", TraceEventSourceType::Task, 4, Some(0.5))
+        sink.record_span_start("main_task", SourceType::Task, 4, Some(0.5))
             .unwrap();
-        assert_eq!(sink.messages[0].relative_deadline_ms(), Some(&0.5_f32));
+        let TraceEvent::SpanStart {
+            relative_deadline_ms,
+            ..
+        } = &sink.messages[0]
+        else {
+            panic!("expected SpanStart");
+        };
+        assert_eq!(*relative_deadline_ms, Some(0.5_f32));
     }
 
     #[test]
     fn record_span_start_without_deadline_has_no_deadline() {
         let mut sink = CaptureSink::new();
-        sink.record_span_start("gyro_isr", TraceEventSourceType::Isr, 8, None)
+        sink.record_span_start("gyro_isr", SourceType::Isr, 8, None)
             .unwrap();
-        assert_eq!(sink.messages[0].relative_deadline_ms(), None);
+        let TraceEvent::SpanStart {
+            relative_deadline_ms,
+            ..
+        } = &sink.messages[0]
+        else {
+            panic!("expected SpanStart");
+        };
+        assert_eq!(*relative_deadline_ms, None);
     }
 
     #[test]
     fn record_span_end_has_no_deadline() {
         let mut sink = CaptureSink::new();
         sink.record_span_end("main_task").unwrap();
-        assert_eq!(sink.messages[0].relative_deadline_ms(), None);
+        assert!(matches!(sink.messages[0], TraceEvent::SpanEnd { .. }));
     }
 
     #[test]
     fn record_span_start_sets_source_type_and_priority() {
         let mut sink = CaptureSink::new();
-        sink.record_span_start("gyro_isr", TraceEventSourceType::Isr, 8, None)
+        sink.record_span_start("gyro_isr", SourceType::Isr, 8, None)
             .unwrap();
-        let msg = &sink.messages[0];
-        assert_eq!(msg.source_type, TraceEventSourceType::Isr);
-        assert_eq!(msg.priority, 8);
+        let TraceEvent::SpanStart {
+            source_type,
+            priority,
+            ..
+        } = &sink.messages[0]
+        else {
+            panic!("expected SpanStart");
+        };
+        assert_eq!(*source_type, SourceType::Isr);
+        assert_eq!(*priority, 8);
     }
 
     #[test]
     fn record_span_start_uses_elapsed_nanoseconds_for_timestamp() {
         let mut sink = CaptureSink::with_timestamp(12_345_678);
-        sink.record_span_start("main_task", TraceEventSourceType::Task, 4, None)
+        sink.record_span_start("main_task", SourceType::Task, 4, None)
             .unwrap();
-        assert_eq!(sink.messages[0].timestamp_ns, 12_345_678);
+        let TraceEvent::SpanStart { timestamp_ns, .. } = &sink.messages[0] else {
+            panic!("expected SpanStart");
+        };
+        assert_eq!(*timestamp_ns, 12_345_678);
     }
 
     #[test]
     fn record_span_end_uses_elapsed_nanoseconds_for_timestamp() {
         let mut sink = CaptureSink::with_timestamp(99_000_000);
         sink.record_span_end("led_task").unwrap();
-        assert_eq!(sink.messages[0].timestamp_ns, 99_000_000);
+        let TraceEvent::SpanEnd { timestamp_ns, .. } = &sink.messages[0] else {
+            panic!("expected SpanEnd");
+        };
+        assert_eq!(*timestamp_ns, 99_000_000);
     }
 
     #[test]
@@ -286,7 +302,7 @@ mod tests {
         let mut sink = CaptureSink::new();
         let result = sink.record_span_start(
             "this_name_is_way_too_long_for_limit",
-            TraceEventSourceType::Task,
+            SourceType::Task,
             2,
             None,
         );
@@ -304,7 +320,7 @@ mod tests {
 
     #[test]
     fn send_error_propagated_from_record_span_start() {
-        let result = ErrorSink.record_span_start("main_task", TraceEventSourceType::Task, 4, None);
+        let result = ErrorSink.record_span_start("main_task", SourceType::Task, 4, None);
         assert_eq!(result, Err(TracingError::SendFailed));
     }
 
@@ -318,28 +334,37 @@ mod tests {
     fn record_marker_sets_marker_event_type() {
         let mut sink = CaptureSink::new();
         sink.record_marker("ukf_predict", None).unwrap();
-        assert_eq!(sink.messages[0].event_type, TraceEventType::Marker);
+        assert!(matches!(sink.messages[0], TraceEvent::Marker { .. }));
     }
 
     #[test]
     fn record_marker_with_value_sets_marker_value() {
         let mut sink = CaptureSink::new();
         sink.record_marker("drain_done", Some(42)).unwrap();
-        assert_eq!(sink.messages[0].marker_value(), Some(&42_u32));
+        let TraceEvent::Marker { marker_value, .. } = &sink.messages[0] else {
+            panic!("expected Marker");
+        };
+        assert_eq!(*marker_value, Some(42_u32));
     }
 
     #[test]
     fn record_marker_without_value_has_no_marker_value() {
         let mut sink = CaptureSink::new();
         sink.record_marker("ukf_predict", None).unwrap();
-        assert_eq!(sink.messages[0].marker_value(), None);
+        let TraceEvent::Marker { marker_value, .. } = &sink.messages[0] else {
+            panic!("expected Marker");
+        };
+        assert_eq!(*marker_value, None);
     }
 
     #[test]
     fn record_marker_uses_elapsed_nanoseconds_for_timestamp() {
         let mut sink = CaptureSink::with_timestamp(5_000_000);
         sink.record_marker("checkpoint", None).unwrap();
-        assert_eq!(sink.messages[0].timestamp_ns, 5_000_000);
+        let TraceEvent::Marker { timestamp_ns, .. } = &sink.messages[0] else {
+            panic!("expected Marker");
+        };
+        assert_eq!(*timestamp_ns, 5_000_000);
     }
 
     #[test]
@@ -354,22 +379,5 @@ mod tests {
     fn send_error_propagated_from_record_marker() {
         let result = ErrorSink.record_marker("ukf_predict", None);
         assert_eq!(result, Err(TracingError::SendFailed));
-    }
-
-    #[test]
-    fn record_marker_has_no_deadline() {
-        let mut sink = CaptureSink::new();
-        sink.record_marker("checkpoint", Some(1)).unwrap();
-        assert_eq!(sink.messages[0].relative_deadline_ms(), None);
-    }
-
-    #[test]
-    fn record_marker_source_type_is_unspecified() {
-        let mut sink = CaptureSink::new();
-        sink.record_marker("checkpoint", None).unwrap();
-        assert_eq!(
-            sink.messages[0].source_type,
-            TraceEventSourceType::Unspecified
-        );
     }
 }

@@ -9,8 +9,7 @@
 
 use execution_trace::encode::{MAX_TRACE_FRAME_SIZE, decode_trace_frame};
 use execution_trace::{
-    SequenceEncoder, TraceEvent, TraceEventSourceType, TraceEventType, TraceSink, TraceTransport,
-    TracingError,
+    SequenceEncoder, SourceType, TraceEvent, TraceSink, TraceTransport, TracingError,
 };
 
 // A sink that encodes each event into a byte buffer that can be written to a file or
@@ -77,21 +76,21 @@ fn main() -> std::io::Result<()> {
     let ms = 1_000_000u64; // nanoseconds per millisecond
 
     sink.tick_ns = 0;
-    sink.record_span_start("gyro_isr", TraceEventSourceType::Isr, 8, None)
+    sink.record_span_start("gyro_isr", SourceType::Isr, 8, None)
         .ok();
 
     sink.tick_ns = 400 * (ms / 1000);
     sink.record_span_end("gyro_isr").ok();
 
     sink.tick_ns = ms;
-    sink.record_span_start("control_task", TraceEventSourceType::Task, 4, Some(10.0))
+    sink.record_span_start("control_task", SourceType::Task, 4, Some(10.0))
         .ok();
 
     sink.tick_ns = 2 * ms;
     sink.record_marker("ukf_predict", None).ok();
 
     sink.tick_ns = 3 * ms;
-    sink.record_span_start("gyro_isr", TraceEventSourceType::Isr, 8, None)
+    sink.record_span_start("gyro_isr", SourceType::Isr, 8, None)
         .ok();
 
     sink.tick_ns = 3 * ms + 400 * (ms / 1000);
@@ -105,14 +104,14 @@ fn main() -> std::io::Result<()> {
 
     // Second loop iteration
     sink.tick_ns = 10 * ms;
-    sink.record_span_start("gyro_isr", TraceEventSourceType::Isr, 8, None)
+    sink.record_span_start("gyro_isr", SourceType::Isr, 8, None)
         .ok();
 
     sink.tick_ns = 10 * ms + 400 * (ms / 1000);
     sink.record_span_end("gyro_isr").ok();
 
     sink.tick_ns = 11 * ms;
-    sink.record_span_start("control_task", TraceEventSourceType::Task, 4, Some(7.0))
+    sink.record_span_start("control_task", SourceType::Task, 4, Some(7.0))
         .ok();
 
     sink.tick_ns = 12 * ms;
@@ -144,25 +143,71 @@ fn main() -> std::io::Result<()> {
     while pos < bytes.len() {
         match decode_trace_frame(&bytes[pos..]) {
             Ok((event, consumed)) => {
-                let ts_ms = event.timestamp_ns as f64 / 1_000_000.0;
-                let event_type = event_type_label(event.event_type);
-                let source = source_type_label(event.source_type);
-                let mut extras = String::new();
-                if let Some(dl) = event.relative_deadline_ms() {
-                    extras.push_str(&format!("rel_deadline={dl:.1}ms "));
+                match &event {
+                    TraceEvent::SpanStart {
+                        sequence,
+                        name,
+                        source_type,
+                        timestamp_ns,
+                        relative_deadline_ms,
+                        ..
+                    } => {
+                        let ts_ms = *timestamp_ns as f64 / 1_000_000.0;
+                        let source = match source_type {
+                            SourceType::Isr => "ISR",
+                            SourceType::Task => "Task",
+                        };
+                        let mut extras = String::new();
+                        if let Some(dl) = relative_deadline_ms {
+                            extras.push_str(&format!("rel_deadline={dl:.1}ms "));
+                        }
+                        println!(
+                            "{:<6} {:<14} {:<12} {:<10} {:<8.3} {}",
+                            sequence,
+                            name.as_str(),
+                            "SpanStart",
+                            source,
+                            ts_ms,
+                            extras,
+                        );
+                    }
+                    TraceEvent::SpanEnd {
+                        sequence,
+                        name,
+                        timestamp_ns,
+                    } => {
+                        let ts_ms = *timestamp_ns as f64 / 1_000_000.0;
+                        println!(
+                            "{:<6} {:<14} {:<12} {:<10} {:<8.3}",
+                            sequence,
+                            name.as_str(),
+                            "SpanEnd",
+                            "-",
+                            ts_ms,
+                        );
+                    }
+                    TraceEvent::Marker {
+                        sequence,
+                        name,
+                        timestamp_ns,
+                        marker_value,
+                    } => {
+                        let ts_ms = *timestamp_ns as f64 / 1_000_000.0;
+                        let mut extras = String::new();
+                        if let Some(v) = marker_value {
+                            extras.push_str(&format!("value={v}"));
+                        }
+                        println!(
+                            "{:<6} {:<14} {:<12} {:<10} {:<8.3} {}",
+                            sequence,
+                            name.as_str(),
+                            "Marker",
+                            "-",
+                            ts_ms,
+                            extras,
+                        );
+                    }
                 }
-                if let Some(v) = event.marker_value() {
-                    extras.push_str(&format!("value={v}"));
-                }
-                println!(
-                    "{:<6} {:<14} {:<12} {:<10} {:<8.3} {}",
-                    event.sequence,
-                    event.name.as_str(),
-                    event_type,
-                    source,
-                    ts_ms,
-                    extras,
-                );
                 pos += consumed;
             }
             Err(e) => {
@@ -173,28 +218,6 @@ fn main() -> std::io::Result<()> {
     }
 
     Ok(())
-}
-
-fn event_type_label(t: TraceEventType) -> &'static str {
-    if t == TraceEventType::SpanStart {
-        "SpanStart"
-    } else if t == TraceEventType::SpanEnd {
-        "SpanEnd"
-    } else if t == TraceEventType::Marker {
-        "Marker"
-    } else {
-        "Unknown"
-    }
-}
-
-fn source_type_label(t: TraceEventSourceType) -> &'static str {
-    if t == TraceEventSourceType::Isr {
-        "ISR"
-    } else if t == TraceEventSourceType::Task {
-        "Task"
-    } else {
-        "-"
-    }
 }
 
 fn count_frames(buf: &[u8]) -> usize {

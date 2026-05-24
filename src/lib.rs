@@ -7,6 +7,7 @@
 
 pub mod encode;
 mod sink;
+mod types;
 
 mod proto {
     #![allow(
@@ -33,5 +34,5 @@ mod proto {
 }
 
 pub use encode::SequenceEncoder;
-pub use proto::tracing_::{TraceEvent, TraceEventSourceType, TraceEventType};
 pub use sink::{NoopSink, TraceSink, TraceTransport, TracingError};
+pub use types::{SourceType, TraceEvent};

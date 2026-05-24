@@ -32,7 +32,7 @@ pub fn encode_trace_frame(
     sequence: u32,
     out: &mut [u8],
 ) -> Result<usize, TracingEncodeError> {
-    let proto_msg = build_proto_message(msg, sequence);
+    let proto_msg = to_proto(msg, sequence);
 
     let mut vec: heapless::Vec<u8, MAX_TRACE_FRAME_SIZE> = heapless::Vec::new();
     let mut encoder = PbEncoder::new(vec);
@@ -56,7 +56,7 @@ pub enum TracingDecodeError {
     Truncated,
     /// The leading varint length prefix is malformed or incomplete.
     MalformedVarint,
-    /// `micropb` rejected the protobuf payload bytes.
+    /// `micropb` rejected the protobuf payload bytes, or the event type is unknown.
     DecodeError,
 }
 
@@ -78,10 +78,11 @@ pub fn decode_trace_frame(frame: &[u8]) -> Result<(TraceEvent, usize), TracingDe
     }
     let payload = &frame[header_len..total];
     let mut decoder = PbDecoder::new(payload);
-    let mut event = TraceEvent::default();
-    event
+    let mut proto_event = crate::proto::tracing_::TraceEvent::default();
+    proto_event
         .decode(&mut decoder, payload_len)
         .map_err(|_| TracingDecodeError::DecodeError)?;
+    let event = from_proto(proto_event).ok_or(TracingDecodeError::DecodeError)?;
     Ok((event, total))
 }
 
@@ -147,81 +148,171 @@ fn decode_varint(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-fn build_proto_message(msg: &TraceEvent, sequence: u32) -> TraceEvent {
-    let mut out = TraceEvent {
-        timestamp_ns: msg.timestamp_ns,
-        name: msg.name.clone(),
-        source_type: msg.source_type,
-        event_type: msg.event_type,
-        sequence,
-        priority: msg.priority,
-        ..Default::default()
-    };
-    if let Some(&dl) = msg.r#relative_deadline_ms() {
-        out.set_relative_deadline_ms(dl);
+fn to_proto(event: &TraceEvent, sequence: u32) -> crate::proto::tracing_::TraceEvent {
+    use crate::proto::tracing_ as pb;
+    use crate::types::SourceType;
+
+    match event {
+        TraceEvent::SpanStart {
+            timestamp_ns,
+            name,
+            source_type,
+            priority,
+            relative_deadline_ms,
+            ..
+        } => {
+            let pb_source = match source_type {
+                SourceType::Isr => pb::TraceEventSourceType::Isr,
+                SourceType::Task => pb::TraceEventSourceType::Task,
+            };
+            let mut msg = pb::TraceEvent {
+                timestamp_ns: *timestamp_ns,
+                name: name.clone(),
+                source_type: pb_source,
+                event_type: pb::TraceEventType::SpanStart,
+                sequence,
+                priority: *priority,
+                ..Default::default()
+            };
+            if let Some(dl) = relative_deadline_ms {
+                msg.set_relative_deadline_ms(*dl);
+            }
+            msg
+        }
+        TraceEvent::SpanEnd {
+            timestamp_ns, name, ..
+        } => pb::TraceEvent {
+            timestamp_ns: *timestamp_ns,
+            name: name.clone(),
+            event_type: pb::TraceEventType::SpanEnd,
+            sequence,
+            ..Default::default()
+        },
+        TraceEvent::Marker {
+            timestamp_ns,
+            name,
+            marker_value,
+            ..
+        } => {
+            let mut msg = pb::TraceEvent {
+                timestamp_ns: *timestamp_ns,
+                name: name.clone(),
+                event_type: pb::TraceEventType::Marker,
+                sequence,
+                ..Default::default()
+            };
+            if let Some(v) = marker_value {
+                msg.set_marker_value(*v);
+            }
+            msg
+        }
     }
-    if let Some(&v) = msg.marker_value() {
-        out.set_marker_value(v);
+}
+
+fn from_proto(p: crate::proto::tracing_::TraceEvent) -> Option<TraceEvent> {
+    use crate::proto::tracing_ as pb;
+    use crate::types::SourceType;
+
+    let et = p.event_type;
+    if et == pb::TraceEventType::SpanStart {
+        let source_type = if p.source_type == pb::TraceEventSourceType::Isr {
+            SourceType::Isr
+        } else if p.source_type == pb::TraceEventSourceType::Task {
+            SourceType::Task
+        } else {
+            return None;
+        };
+        let relative_deadline_ms = p.relative_deadline_ms().copied();
+        Some(TraceEvent::SpanStart {
+            timestamp_ns: p.timestamp_ns,
+            source_type,
+            sequence: p.sequence,
+            priority: p.priority,
+            relative_deadline_ms,
+            name: p.name,
+        })
+    } else if et == pb::TraceEventType::SpanEnd {
+        Some(TraceEvent::SpanEnd {
+            timestamp_ns: p.timestamp_ns,
+            sequence: p.sequence,
+            name: p.name,
+        })
+    } else if et == pb::TraceEventType::Marker {
+        let marker_value = p.marker_value().copied();
+        Some(TraceEvent::Marker {
+            timestamp_ns: p.timestamp_ns,
+            sequence: p.sequence,
+            marker_value,
+            name: p.name,
+        })
+    } else {
+        None
     }
-    out
 }
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
-    use crate::{TraceEventSourceType, TraceEventType};
+    use crate::SourceType;
     use heapless::String;
     use insta::assert_debug_snapshot;
 
     fn make_span_start() -> TraceEvent {
         let mut name: String<32> = String::new();
         name.push_str("led_task").unwrap();
-        TraceEvent {
+        TraceEvent::SpanStart {
             timestamp_ns: 1_000_000,
             name,
-            source_type: TraceEventSourceType::Task,
-            event_type: TraceEventType::SpanStart,
+            source_type: SourceType::Task,
             sequence: 0,
             priority: 2,
-            ..Default::default()
+            relative_deadline_ms: None,
         }
     }
 
     fn make_span_start_with_deadline() -> TraceEvent {
-        let mut msg = make_span_start();
-        msg.set_relative_deadline_ms(0.5);
-        msg
+        let mut name: String<32> = String::new();
+        name.push_str("led_task").unwrap();
+        TraceEvent::SpanStart {
+            timestamp_ns: 1_000_000,
+            name,
+            source_type: SourceType::Task,
+            sequence: 0,
+            priority: 2,
+            relative_deadline_ms: Some(0.5),
+        }
     }
 
     fn make_span_end() -> TraceEvent {
         let mut name: String<32> = String::new();
         name.push_str("gyro_isr").unwrap();
-        TraceEvent {
+        TraceEvent::SpanEnd {
             timestamp_ns: 2_000_000,
             name,
-            source_type: TraceEventSourceType::Isr,
-            event_type: TraceEventType::SpanEnd,
             sequence: 0,
-            priority: 8,
-            ..Default::default()
         }
     }
 
     fn make_marker() -> TraceEvent {
         let mut name: String<32> = String::new();
         name.push_str("ukf_predict").unwrap();
-        TraceEvent {
+        TraceEvent::Marker {
             timestamp_ns: 1_500_000,
             name,
-            event_type: TraceEventType::Marker,
-            ..Default::default()
+            sequence: 0,
+            marker_value: None,
         }
     }
 
     fn make_marker_with_value() -> TraceEvent {
-        let mut msg = make_marker();
-        msg.set_marker_value(42);
-        msg
+        let mut name: String<32> = String::new();
+        name.push_str("ukf_predict").unwrap();
+        TraceEvent::Marker {
+            timestamp_ns: 1_500_000,
+            name,
+            sequence: 0,
+            marker_value: Some(42),
+        }
     }
 
     fn encode(msg: &TraceEvent, seq: u32) -> ([u8; MAX_TRACE_FRAME_SIZE], usize) {
@@ -398,10 +489,16 @@ mod tests {
         let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
         let n = enc.encode(&make_span_start(), &mut buf).unwrap();
         let (decoded, _) = decode_trace_frame(&buf[..n]).unwrap();
-        assert_eq!(decoded.sequence, 0);
+        let TraceEvent::SpanStart { sequence, .. } = decoded else {
+            panic!("expected SpanStart");
+        };
+        assert_eq!(sequence, 0);
         let n = enc.encode(&make_span_start(), &mut buf).unwrap();
         let (decoded, _) = decode_trace_frame(&buf[..n]).unwrap();
-        assert_eq!(decoded.sequence, 1);
+        let TraceEvent::SpanStart { sequence, .. } = decoded else {
+            panic!("expected SpanStart");
+        };
+        assert_eq!(sequence, 1);
     }
 
     #[test]
@@ -423,46 +520,69 @@ mod tests {
 
     #[test]
     fn round_trip_span_start_preserves_fields() {
-        let original = make_span_start();
-        let decoded = round_trip(&original, 7);
-        assert_eq!(decoded.name, original.name);
-        assert_eq!(decoded.event_type, original.event_type);
-        assert_eq!(decoded.source_type, original.source_type);
-        assert_eq!(decoded.timestamp_ns, original.timestamp_ns);
-        assert_eq!(decoded.priority, original.priority);
-        assert_eq!(decoded.sequence, 7);
+        let decoded = round_trip(&make_span_start(), 7);
+        let TraceEvent::SpanStart {
+            name,
+            source_type,
+            timestamp_ns,
+            priority,
+            sequence,
+            relative_deadline_ms,
+        } = decoded
+        else {
+            panic!("expected SpanStart");
+        };
+        assert_eq!(name.as_str(), "led_task");
+        assert_eq!(source_type, SourceType::Task);
+        assert_eq!(timestamp_ns, 1_000_000);
+        assert_eq!(priority, 2);
+        assert_eq!(sequence, 7);
+        assert_eq!(relative_deadline_ms, None);
     }
 
     #[test]
     fn round_trip_span_start_with_deadline_preserves_deadline() {
-        let original = make_span_start_with_deadline();
-        let decoded = round_trip(&original, 0);
-        assert_eq!(decoded.relative_deadline_ms(), Some(&0.5_f32));
+        let decoded = round_trip(&make_span_start_with_deadline(), 0);
+        let TraceEvent::SpanStart {
+            relative_deadline_ms,
+            ..
+        } = decoded
+        else {
+            panic!("expected SpanStart");
+        };
+        assert_eq!(relative_deadline_ms, Some(0.5_f32));
     }
 
     #[test]
     fn round_trip_span_end_preserves_fields() {
-        let original = make_span_end();
-        let decoded = round_trip(&original, 3);
-        assert_eq!(decoded.name, original.name);
-        assert_eq!(decoded.event_type, original.event_type);
-        assert_eq!(decoded.source_type, original.source_type);
+        let decoded = round_trip(&make_span_end(), 3);
+        let TraceEvent::SpanEnd { name, sequence, .. } = decoded else {
+            panic!("expected SpanEnd");
+        };
+        assert_eq!(name.as_str(), "gyro_isr");
+        assert_eq!(sequence, 3);
     }
 
     #[test]
     fn round_trip_marker_preserves_fields() {
-        let original = make_marker();
-        let decoded = round_trip(&original, 0);
-        assert_eq!(decoded.name, original.name);
-        assert_eq!(decoded.event_type, original.event_type);
-        assert_eq!(decoded.marker_value(), None);
+        let decoded = round_trip(&make_marker(), 0);
+        let TraceEvent::Marker {
+            name, marker_value, ..
+        } = decoded
+        else {
+            panic!("expected Marker");
+        };
+        assert_eq!(name.as_str(), "ukf_predict");
+        assert_eq!(marker_value, None);
     }
 
     #[test]
     fn round_trip_marker_with_value_preserves_value() {
-        let original = make_marker_with_value();
-        let decoded = round_trip(&original, 0);
-        assert_eq!(decoded.marker_value(), Some(&42_u32));
+        let decoded = round_trip(&make_marker_with_value(), 0);
+        let TraceEvent::Marker { marker_value, .. } = decoded else {
+            panic!("expected Marker");
+        };
+        assert_eq!(marker_value, Some(42_u32));
     }
 
     #[test]
