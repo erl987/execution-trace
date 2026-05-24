@@ -11,7 +11,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: cargo test --features std
       - run: cargo clippy --features std -- -D warnings
       - run: cargo fmt --check
