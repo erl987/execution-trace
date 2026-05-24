@@ -12,22 +12,30 @@ post-mortem analysis.
 
 ## Quick start
 
-### 1. Implement `TraceSink` for your transport
+### 1. Implement `TraceTransport` and `TraceSink` for your transport
+
+`TraceTransport` is the low-level primitive: it receives a pre-constructed [`TraceEvent`] and
+forwards it over your chosen transport. `TraceSink` is the recording layer built on top: it reads
+the hardware clock and calls the `record_*` helpers.
+
+Types that only move pre-built events (e.g., a downstream serialiser driven by a task queue)
+implement `TraceTransport` alone. Types that also originate recordings implement both.
 
 ```rust
 # fn hardware_timer_ns() -> u64 { 0 }
-use execution_trace::{TraceSink, TracingError, TraceEvent};
+use execution_trace::{TraceTransport, TraceSink, TracingError, TraceEvent};
 
 struct MyRttSink { /* ... */ }
 
-impl TraceSink for MyRttSink {
-    fn try_send(&mut self, event: TraceEvent) -> Result<(), TracingError> {
+impl TraceTransport for MyRttSink {
+    fn write_event(&mut self, event: TraceEvent) -> Result<(), TracingError> {
         // encode and forward the event bytes over your chosen transport
         Ok(())
     }
+}
 
+impl TraceSink for MyRttSink {
     fn get_elapsed_nanoseconds(&self) -> u64 {
-        // return hardware timer value; the default impl returns 0
         hardware_timer_ns()
     }
 }

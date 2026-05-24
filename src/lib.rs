@@ -34,4 +34,4 @@ mod proto {
 
 pub use encode::SequenceEncoder;
 pub use proto::tracing_::{TraceEvent, TraceEventSourceType, TraceEventType};
-pub use sink::{NoopSink, TraceSink, TracingError};
+pub use sink::{NoopSink, TraceSink, TraceTransport, TracingError};

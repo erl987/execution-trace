@@ -7,9 +7,10 @@
 // diagram from it, run the companion Python script:
 //   python examples/visualize.py
 
+use execution_trace::encode::{MAX_TRACE_FRAME_SIZE, decode_trace_frame};
 use execution_trace::{
-    SequenceEncoder, TraceEvent, TraceEventSourceType, TraceEventType, TraceSink, TracingError,
-    encode::{MAX_TRACE_FRAME_SIZE, decode_trace_frame},
+    SequenceEncoder, TraceEvent, TraceEventSourceType, TraceEventType, TraceSink, TraceTransport,
+    TracingError,
 };
 
 // A sink that encodes each event into a byte buffer that can be written to a file or
@@ -35,8 +36,8 @@ impl FileSink {
     }
 }
 
-impl TraceSink for FileSink {
-    fn try_send(&mut self, event: TraceEvent) -> Result<(), TracingError> {
+impl TraceTransport for FileSink {
+    fn write_event(&mut self, event: TraceEvent) -> Result<(), TracingError> {
         let mut frame = [0u8; MAX_TRACE_FRAME_SIZE];
         let n = self
             .encoder
@@ -45,7 +46,9 @@ impl TraceSink for FileSink {
         self.buf.extend_from_slice(&frame[..n]);
         Ok(())
     }
+}
 
+impl TraceSink for FileSink {
     fn get_elapsed_nanoseconds(&self) -> u64 {
         self.tick_ns
     }

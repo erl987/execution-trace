@@ -1,7 +1,7 @@
 use crate::{TraceEvent, TraceEventSourceType, TraceEventType};
 use heapless::String;
 
-/// Errors that a [`TraceSink`] can return.
+/// Errors that a [`TraceTransport`] or [`TraceSink`] can return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TracingError {
     /// The underlying channel or buffer was full; the event was discarded.
@@ -12,41 +12,47 @@ pub enum TracingError {
     SendFailed,
 }
 
-/// Receives [`TraceEvent`]s produced by instrumented code.
+/// Moves a pre-constructed [`TraceEvent`] to its destination.
+///
+/// This is the low-level primitive for transport implementations (RTT, UART, USB, an RTIC
+/// channel, a `Vec<u8>` for simulation, etc.). Implementors receive already-timestamped events
+/// and are responsible only for serialization and forwarding — not for reading clocks or
+/// constructing events.
+///
+/// To also record spans and markers with hardware timestamps, implement [`TraceSink`] on the
+/// same type.
+///
+/// # Errors
+/// Return [`TracingError::MessageDropped`] when the channel or buffer is full, or another
+/// variant on a hard failure.
+pub trait TraceTransport {
+    /// Forward `event` to the underlying transport.
+    fn write_event(&mut self, event: TraceEvent) -> Result<(), TracingError>;
+}
+
+/// Constructs and records [`TraceEvent`]s with hardware timestamps.
 ///
 /// # Design
 ///
 /// `TraceSink` operates in two layers:
 ///
-/// 1. **Event layer** — `record_span_start`, `record_span_end`, and `record_marker` construct
-///    [`TraceEvent`]s and hand them to `try_send`. Sequence numbers are left at zero here;
-///    they are injected by the encoder.
-/// 2. **Encoder/transport layer** — code that owns the wire (e.g. [`SequenceEncoder`]) calls
-///    [`encode_trace_frame`] with a monotonically increasing sequence counter before writing
-///    bytes to RTT, UART, etc. The sequence allows the host decoder to detect dropped frames.
+/// 1. **Recording layer** — `record_span_start`, `record_span_end`, and `record_marker`
+///    read the hardware clock via `get_elapsed_nanoseconds`, construct [`TraceEvent`]s
+///    (sequence left at zero), and hand them to [`TraceTransport::write_event`].
+/// 2. **Transport layer** — code that owns the wire (e.g. [`SequenceEncoder`]) injects a
+///    monotonic sequence counter before writing bytes to RTT, UART, etc. The sequence
+///    allows the host decoder to detect dropped frames.
 ///
-/// For tests, use [`NoopSink`], which discards all events at zero cost.
+/// For tests or placeholders, use [`NoopSink`], which discards all events at zero cost.
 ///
 /// [`SequenceEncoder`]: crate::SequenceEncoder
-/// [`encode_trace_frame`]: crate::encode::encode_trace_frame
-pub trait TraceSink {
-    /// The primitive implementors must provide: forward `message` to the transport.
-    ///
-    /// All `record_*` methods build a [`TraceEvent`] and call this. Return
-    /// [`TracingError::MessageDropped`] when the channel is full, or another variant on a
-    /// hard failure.
-    ///
-    /// # Errors
-    /// Propagates whatever [`TracingError`] variant is appropriate for the transport.
-    fn try_send(&mut self, message: TraceEvent) -> Result<(), TracingError>;
-
+pub trait TraceSink: TraceTransport {
     /// Returns the current monotonic time in nanoseconds.
     ///
-    /// The default implementation returns `0`. Override this with a hardware timer read so that
-    /// recorded timestamps are meaningful.
-    fn get_elapsed_nanoseconds(&self) -> u64 {
-        0
-    }
+    /// This method has no default — every `TraceSink` implementor must wire up a real clock
+    /// source. Returning a constant `0` is valid for stubs, but must be done explicitly to
+    /// avoid silent zero timestamps in production code.
+    fn get_elapsed_nanoseconds(&self) -> u64;
 
     /// Records the start of a named execution span.
     ///
@@ -62,7 +68,7 @@ pub trait TraceSink {
     ///
     /// # Errors
     /// Returns [`TracingError::MessageDropped`] if the name exceeds 32 bytes.
-    /// Otherwise propagates whatever `try_send` returns.
+    /// Otherwise, propagates whatever `write_event` returns.
     fn record_span_start(
         &mut self,
         source_name: &'static str,
@@ -85,7 +91,7 @@ pub trait TraceSink {
         if let Some(dl) = relative_deadline_ms {
             msg.set_relative_deadline_ms(dl);
         }
-        self.try_send(msg)
+        self.write_event(msg)
     }
 
     /// Records the end of a named execution span previously started with [`record_span_start`].
@@ -97,12 +103,12 @@ pub trait TraceSink {
     ///
     /// # Errors
     /// Returns [`TracingError::MessageDropped`] if the name exceeds 32 bytes.
-    /// Otherwise propagates whatever `try_send` returns.
+    /// Otherwise propagates whatever `write_event` returns.
     fn record_span_end(&mut self, source_name: &'static str) -> Result<(), TracingError> {
         let mut name: String<32> = String::new();
         name.push_str(source_name)
             .map_err(|_| TracingError::MessageDropped)?;
-        self.try_send(TraceEvent {
+        self.write_event(TraceEvent {
             timestamp_ns: self.get_elapsed_nanoseconds(),
             name,
             event_type: TraceEventType::SpanEnd,
@@ -121,7 +127,7 @@ pub trait TraceSink {
     ///
     /// # Errors
     /// Returns [`TracingError::MessageDropped`] if the label exceeds 32 bytes.
-    /// Otherwise propagates whatever `try_send` returns.
+    /// Otherwise propagates whatever `write_event` returns.
     fn record_marker(
         &mut self,
         label: &'static str,
@@ -139,7 +145,7 @@ pub trait TraceSink {
         if let Some(v) = value {
             msg.set_marker_value(v);
         }
-        self.try_send(msg)
+        self.write_event(msg)
     }
 }
 
@@ -148,9 +154,15 @@ pub trait TraceSink {
 /// Useful as a placeholder in unit tests where tracing output is irrelevant.
 pub struct NoopSink;
 
-impl TraceSink for NoopSink {
-    fn try_send(&mut self, _: TraceEvent) -> Result<(), TracingError> {
+impl TraceTransport for NoopSink {
+    fn write_event(&mut self, _: TraceEvent) -> Result<(), TracingError> {
         Ok(())
+    }
+}
+
+impl TraceSink for NoopSink {
+    fn get_elapsed_nanoseconds(&self) -> u64 {
+        0
     }
 }
 
@@ -179,12 +191,14 @@ mod tests {
         }
     }
 
-    impl TraceSink for CaptureSink {
-        fn try_send(&mut self, message: TraceEvent) -> Result<(), TracingError> {
+    impl TraceTransport for CaptureSink {
+        fn write_event(&mut self, message: TraceEvent) -> Result<(), TracingError> {
             self.messages.push(message);
             Ok(())
         }
+    }
 
+    impl TraceSink for CaptureSink {
         fn get_elapsed_nanoseconds(&self) -> u64 {
             self.timestamp_ns
         }
@@ -192,9 +206,15 @@ mod tests {
 
     struct ErrorSink;
 
-    impl TraceSink for ErrorSink {
-        fn try_send(&mut self, _: TraceEvent) -> Result<(), TracingError> {
+    impl TraceTransport for ErrorSink {
+        fn write_event(&mut self, _: TraceEvent) -> Result<(), TracingError> {
             Err(TracingError::SendFailed)
+        }
+    }
+
+    impl TraceSink for ErrorSink {
+        fn get_elapsed_nanoseconds(&self) -> u64 {
+            0
         }
     }
 
