@@ -104,7 +104,7 @@ longer names cause `record_*` to return [`TracingError::MessageDropped`] before 
 
 ## Host-side tooling
 
-The companion Python package `execution-trace` decodes the binary stream, matches span start/end pairs,
+The companion Python package `embedded-etrace` decodes the binary stream, matches span start/end pairs,
 and renders a zoomable Bokeh timing diagram as a standalone HTML file. The intermediate format is
 a CSV with columns `name`, `type`, `start_us`, `end_us`, `priority`, `deadline_us`, and `value`.
 
@@ -115,7 +115,7 @@ workflow without any hardware:
 
 ```bash
 # 1. Install the Python package with diagram support
-pip install execution-trace[diagram]
+pip install embedded-etrace[diagram]
 
 # 2. Simulate an embedded trace and write it to trace.bin
 cargo run --example simulate --features std

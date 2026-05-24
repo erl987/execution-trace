@@ -1,4 +1,4 @@
-"""execution-trace — decode and visualise no_std embedded execution traces.
+"""embedded-etrace — decode and visualise no_std embedded execution traces.
 
 Public API re-exported for convenience::
 
@@ -9,7 +9,7 @@ Public API re-exported for convenience::
     )
 
 The :mod:`execution_trace.diagram` module is **not** re-exported here because it
-requires the optional ``[diagram]`` extra (``pip install execution-trace[diagram]``).
+requires the optional ``[diagram]`` extra (``pip install embedded-etrace[diagram]``).
 Import it directly when needed::
 
     from execution_trace.diagram import generate_diagram

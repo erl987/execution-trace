@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "execution-trace"
+name = "embedded-etrace"
 version = "0.1.0"
 description = "Decode and visualise no_std embedded execution traces over RTT or any byte transport"
 authors = [{ name = "Ralf Rettig" }]

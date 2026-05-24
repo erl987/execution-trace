@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for the execution-trace test suite."""
+"""Shared pytest fixtures for the embedded-etrace test suite."""
 
 import pytest
 

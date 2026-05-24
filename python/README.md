@@ -1,4 +1,4 @@
-# execution-trace
+# embedded-etrace
 
 Decode and visualise **no_std embedded execution traces** over RTT or any byte transport.
 
@@ -13,10 +13,10 @@ HTML timing diagrams.
 
 ```bash
 # Core decoder only (no diagram dependencies):
-pip install execution-trace
+pip install embedded-etrace
 
 # With the interactive Bokeh diagram generator:
-pip install execution-trace[diagram]
+pip install embedded-etrace[diagram]
 ```
 
 Requires Python 3.11+.

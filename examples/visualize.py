@@ -2,7 +2,7 @@
 """Decode a binary trace file and render an interactive Bokeh timing diagram.
 
 Prerequisites:
-    pip install execution-trace[diagram]
+    pip install embedded-etrace[diagram]
 
 Usage:
     python examples/visualize.py [--input trace.bin] [--output diagram.html] [--title TITLE]

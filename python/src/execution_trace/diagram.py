@@ -74,7 +74,7 @@ try:
 except ImportError as _err:
     raise ImportError(
         "execution_trace.diagram requires the [diagram] optional dependencies. "
-        "Install them with:  pip install execution-trace[diagram]"
+        "Install them with:  pip install embedded-etrace[diagram]"
     ) from _err
 
 logger = logging.getLogger(__name__)
