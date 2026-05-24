@@ -603,6 +603,24 @@ mod tests {
     }
 
     #[test]
+    fn decode_varint_overflow_returns_malformed_varint() {
+        // 10 bytes each with the continuation bit set — shift reaches 70, exceeding
+        // the 64-bit limit and hitting the `shift >= 64` guard in decode_varint.
+        let overlong: Vec<u8> = (0..10).map(|_| 0xFF).collect();
+        assert_eq!(
+            decode_varint(&overlong),
+            None,
+            "varint with shift >= 64 must return None"
+        );
+        // Confirm this surfaces as MalformedVarint when used through the public API.
+        let frame: Vec<u8> = overlong.into_iter().chain(std::iter::once(0x00)).collect();
+        assert_eq!(
+            decode_trace_frame(&frame),
+            Err(TracingDecodeError::MalformedVarint)
+        );
+    }
+
+    #[test]
     fn decode_returns_correct_consumed_byte_count() {
         let (buf, n) = encode(&make_marker_with_value(), 5);
         let (_, consumed) = decode_trace_frame(&buf[..n]).unwrap();
