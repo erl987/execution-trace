@@ -22,7 +22,7 @@ dependencies = ["protobuf>=5"]
 
 [project.optional-dependencies]
 diagram = ["pandas>=2", "bokeh>=3"]
-dev     = ["pytest>=8", "pytest-cov", "mypy>=1.10", "mypy-protobuf", "pandas>=2", "bokeh>=3"]
+dev     = ["pytest>=8", "pytest-cov", "mypy>=1.10", "mypy-protobuf", "pandas>=2", "pandas-stubs", "bokeh>=3"]
 
 [project.scripts]
 etrace-decode  = "execution_trace._cli.decode:main"
