@@ -1,6 +1,6 @@
 [package]
 name = "execution-trace"
-version = "0.1.2"
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "no_std embedded execution tracing — transport-agnostic span/marker recording with protobuf framing"

@@ -13,6 +13,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+      - name: Set version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo test --features std
       - run: cargo publish
@@ -26,6 +30,10 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v6
+      - name: Set version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i "s/^version = .*/version = \"$VERSION\"/" python/pyproject.toml
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"

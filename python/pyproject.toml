@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "embedded-etrace"
-version = "0.1.2"
+version = "0.0.0"
 description = "Decode and visualise no_std embedded execution traces over RTT or any byte transport"
 authors = [{ name = "Ralf Rettig" }]
 license = "MIT OR Apache-2.0"
