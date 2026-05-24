@@ -12,6 +12,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+      - run: sudo apt-get install -y protobuf-compiler
       - run: cargo test --features std
       - run: cargo clippy --features std -- -D warnings
       - run: cargo fmt --check
