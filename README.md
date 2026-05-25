@@ -1,11 +1,15 @@
-`no_std` embedded execution tracing with transport-agnostic span/marker recording and protobuf
-wire framing.
+# Embedded execution tracing with transport-agnostic span/marker recording
 
-Records named time spans (task activations, ISR executions) and point-in-time markers on
-bare-metal targets without a heap or OS. Events are serialised as length-delimited protobuf
-frames that you forward over any byte transport — RTT, UART, USB, or a ring buffer for
-post-mortem analysis.
+The graphical visualization and analysis tool is available in the companion Python package
+[`embedded-etrace`](https://pypi.org/project/embedded-etrace) and can be easily installed.
 
+Records *named time spans* (task activations, ISR executions) and *point-in-time markers* on
+**bare-metal targets without a heap or OS**. 
+
+Events are serialized as length-delimited protobuf frames that you forward over any byte 
+transport — RTT, UART, USB, or a ring buffer **for post-mortem analysis in the GUI**.
+
+## Example of a time trace diagram
 ![execution trace timing diagram](https://raw.githubusercontent.com/erl987/execution-trace/main/docs/screenshot_python_app_1.png)
 
 ## Quick start

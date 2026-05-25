@@ -1,12 +1,14 @@
 # embedded-etrace
 
-Decode and visualise **no_std embedded execution traces** over RTT or any byte transport.
+Decode and visualize **embedded execution traces** over RTT or any byte transport.
 
-The companion Rust crate (`execution_trace`) provided by the Cargo package `execution-trace`
+The companion Rust crate (`execution_trace`) provided by the Cargo 
+package [`execution-trace`](https://crates.io/crates/execution-trace)
 runs on your firmware and emits length-delimited protobuf frames for task activations, 
 ISR entries, and point-in-time markers. This Python package decodes those frames on the 
 host and produces interactive HTML timing diagrams.
 
+## Example of a time trace diagram
 ![execution trace timing diagram](https://raw.githubusercontent.com/erl987/execution-trace/main/docs/screenshot_python_app_1.png)
 
 ## Installation
