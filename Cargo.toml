@@ -18,19 +18,20 @@ undocumented_unsafe_blocks = "deny"
 panic = "deny"
 
 [features]
-default = []
+default = ["enabled"]
+enabled = ["dep:heapless", "dep:micropb"]
 std = []
 
 [dependencies]
-heapless = "0.9.2"
-micropb = { version = "0.6.0", default-features = false, features = ["encode", "decode", "container-heapless-0-9", "enable-64bit"] }
+heapless = { version = "0.9.2", optional = true }
+micropb = { version = "0.6.0", default-features = false, features = ["encode", "decode", "container-heapless-0-9", "enable-64bit"], optional = true }
 
 [build-dependencies]
 micropb-gen = "0.6.0"
 
 [[example]]
 name = "simulate"
-required-features = ["std"]
+required-features = ["std", "enabled"]
 
 [dev-dependencies]
 insta = "1"

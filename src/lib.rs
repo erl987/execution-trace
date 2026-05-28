@@ -3,12 +3,15 @@
     html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk.png",
     html_favicon_url = "https://www.rust-lang.org/favicon.ico"
 )]
-#![doc = include_str!("../README.md")]
+// README examples require the `enabled` feature; suppress doc-tests when it is off.
+#![cfg_attr(feature = "enabled", doc = include_str!("../README.md"))]
 
+#[cfg(feature = "enabled")]
 pub mod encode;
 mod sink;
 mod types;
 
+#[cfg(feature = "enabled")]
 mod proto {
     #![allow(
         dead_code,
@@ -34,6 +37,11 @@ mod proto {
     include!(concat!(env!("OUT_DIR"), "/tracing.pb.rs"));
 }
 
+#[cfg(feature = "enabled")]
 pub use encode::SequenceEncoder;
-pub use sink::{NoopSink, TraceSink, TraceTransport, TracingError};
-pub use types::{SourceType, TraceEvent};
+#[cfg(feature = "enabled")]
+pub use sink::TraceTransport;
+pub use sink::{NoopSink, TraceSink, TracingError};
+pub use types::SourceType;
+#[cfg(feature = "enabled")]
+pub use types::TraceEvent;

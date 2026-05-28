@@ -250,7 +250,7 @@ fn from_proto(p: crate::proto::tracing_::TraceEvent) -> Option<TraceEvent> {
     }
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(all(test, feature = "std", feature = "enabled"))]
 mod tests {
     use super::*;
     use crate::SourceType;

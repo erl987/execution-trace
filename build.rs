@@ -4,6 +4,12 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    // Skip codegen when the `enabled` feature is off; the proto module and
+    // encode module are both gated on that feature so no generated file is needed.
+    if env::var("CARGO_FEATURE_ENABLED").is_err() {
+        return;
+    }
+
     println!("cargo:rerun-if-changed=proto/tracing.proto");
 
     let out_file = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("tracing.pb.rs");

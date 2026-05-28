@@ -145,3 +145,43 @@ The crate is `no_std` by default. Enable the `std` feature for tests:
 [dev-dependencies]
 execution-trace = { version = "0.1", features = ["std"] }
 ```
+
+## Compile-time on/off switch (`enabled` feature)
+
+The `enabled` feature (on by default) gates the entire implementation. When you disable it, every
+`TraceSink` method becomes a zero-cost no-op and the compiler eliminates every call site — no
+overhead in production builds, no `#[cfg]` guards in your application code.
+
+```toml
+# Cargo.toml — ship without tracing overhead in production
+[dependencies]
+execution-trace = { version = "0.1", default-features = false }
+
+# Enable tracing only in a profiling profile
+[profile.profiling]
+inherits = "release"
+
+[target.'cfg(feature = "trace")'.dependencies]
+execution-trace = { version = "0.1" }  # default-features includes "enabled"
+```
+
+A simpler approach is to use a Cargo feature in your own crate:
+
+```toml
+# your crate's Cargo.toml
+[features]
+trace = ["execution-trace/enabled"]
+
+[dependencies]
+execution-trace = { version = "0.1", default-features = false }
+```
+
+Then pass `--features trace` (or your own feature name) to enable tracing for a specific build:
+
+```bash
+cargo build --features trace
+```
+
+Your call sites require no changes: `record_span_start`, `record_span_end`, and `record_marker`
+are always present on `TraceSink` regardless of the feature flag — they just compile away when
+`enabled` is off.

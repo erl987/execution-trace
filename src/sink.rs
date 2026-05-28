@@ -1,7 +1,10 @@
+#[cfg(feature = "enabled")]
 use crate::{SourceType, TraceEvent};
+#[cfg(feature = "enabled")]
 use heapless::String;
 
 /// Errors that a [`TraceTransport`] or [`TraceSink`] can return.
+#[cfg(feature = "enabled")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TracingError {
     /// The underlying channel or buffer was full; the event was discarded.
@@ -11,6 +14,13 @@ pub enum TracingError {
     /// The transport-specific send operation failed.
     SendFailed,
 }
+
+/// Errors that a [`TraceSink`] can return.
+///
+/// This is an uninhabited type when the `enabled` feature is off: no event is
+/// ever produced, so no error can ever occur.
+#[cfg(not(feature = "enabled"))]
+pub enum TracingError {}
 
 /// Moves a pre-constructed [`TraceEvent`] to its destination.
 ///
@@ -25,12 +35,17 @@ pub enum TracingError {
 /// # Errors
 /// Return [`TracingError::MessageDropped`] when the channel or buffer is full, or another
 /// variant on a hard failure.
+#[cfg(feature = "enabled")]
 pub trait TraceTransport {
     /// Forward `event` to the underlying transport.
     fn write_event(&mut self, event: TraceEvent) -> Result<(), TracingError>;
 }
 
 /// Constructs and records [`TraceEvent`]s with hardware timestamps.
+///
+/// When the `enabled` feature is active, this trait requires a [`TraceTransport`]
+/// implementation and a hardware clock source. When `enabled` is off, all methods
+/// are no-ops with default implementations — no clock or transport is needed.
 ///
 /// # Design
 ///
@@ -39,13 +54,12 @@ pub trait TraceTransport {
 /// 1. **Recording layer** — `record_span_start`, `record_span_end`, and `record_marker`
 ///    read the hardware clock via `get_elapsed_nanoseconds`, construct [`TraceEvent`]s
 ///    (sequence left at zero), and hand them to [`TraceTransport::write_event`].
-/// 2. **Transport layer** — code that owns the wire (e.g. [`SequenceEncoder`]) injects a
+/// 2. **Transport layer** — code that owns the wire (e.g. [`crate::SequenceEncoder`]) injects a
 ///    monotonic sequence counter before writing bytes to RTT, UART, etc. The sequence
 ///    allows the host decoder to detect dropped frames.
 ///
 /// For tests or placeholders, use [`NoopSink`], which discards all events at zero cost.
-///
-/// [`SequenceEncoder`]: crate::SequenceEncoder
+#[cfg(feature = "enabled")]
 pub trait TraceSink: TraceTransport {
     /// Returns the current monotonic time in nanoseconds.
     ///
@@ -138,24 +152,66 @@ pub trait TraceSink: TraceTransport {
     }
 }
 
+// ── When tracing is disabled: zero-cost stub ──────────────────────────────────
+
+/// Zero-cost stub used when the `enabled` feature is off.
+///
+/// All methods have default no-op implementations; implementors need not provide
+/// a clock source or transport. The compiler eliminates every call site entirely.
+#[cfg(not(feature = "enabled"))]
+#[allow(clippy::missing_errors_doc)]
+pub trait TraceSink {
+    /// No-op stub. Compiled away entirely in release builds.
+    fn record_span_start(
+        &mut self,
+        _source_name: &'static str,
+        _source_type: crate::SourceType,
+        _priority: u8,
+        _relative_deadline_ms: Option<f32>,
+    ) -> Result<(), TracingError> {
+        Ok(())
+    }
+
+    /// No-op stub. Compiled away entirely in release builds.
+    fn record_span_end(&mut self, _source_name: &'static str) -> Result<(), TracingError> {
+        Ok(())
+    }
+
+    /// No-op stub. Compiled away entirely in release builds.
+    fn record_marker(
+        &mut self,
+        _label: &'static str,
+        _value: Option<u32>,
+    ) -> Result<(), TracingError> {
+        Ok(())
+    }
+}
+
+// ── NoopSink — always present ─────────────────────────────────────────────────
+
 /// A [`TraceSink`] that discards all events. Zero-cost in release builds.
 ///
 /// Useful as a placeholder in unit tests where tracing output is irrelevant.
 pub struct NoopSink;
 
+#[cfg(feature = "enabled")]
 impl TraceTransport for NoopSink {
     fn write_event(&mut self, _: TraceEvent) -> Result<(), TracingError> {
         Ok(())
     }
 }
 
+#[cfg(feature = "enabled")]
 impl TraceSink for NoopSink {
     fn get_elapsed_nanoseconds(&self) -> u64 {
         0
     }
 }
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(not(feature = "enabled"))]
+impl TraceSink for NoopSink {}
+
+#[cfg(all(test, feature = "std", feature = "enabled"))]
 mod tests {
     use super::*;
 
