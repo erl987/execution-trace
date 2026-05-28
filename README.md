@@ -153,21 +153,6 @@ The `enabled` feature (on by default) gates the entire implementation. When you 
 overhead in production builds, no `#[cfg]` guards in your application code.
 
 ```toml
-# Cargo.toml — ship without tracing overhead in production
-[dependencies]
-execution-trace = { version = "0.1", default-features = false }
-
-# Enable tracing only in a profiling profile
-[profile.profiling]
-inherits = "release"
-
-[target.'cfg(feature = "trace")'.dependencies]
-execution-trace = { version = "0.1" }  # default-features includes "enabled"
-```
-
-A simpler approach is to use a Cargo feature in your own crate:
-
-```toml
 # your crate's Cargo.toml
 [features]
 trace = ["execution-trace/enabled"]
