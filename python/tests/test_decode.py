@@ -256,6 +256,50 @@ class TestWriteTracingCsv:
         assert rows[0]["start_us"] == rows[0]["end_us"]
         assert rows[0]["type"] == "marker"
 
+    def test_marker_value_of_zero_is_written(self, tmp_path):
+        # Zero is a legitimate payload — a reason code, or a count of nothing — and a
+        # truth test on the value would write it as empty, which reads downstream as
+        # "no value" and hides exactly the case the marker was emitted to report.
+        records = [MarkerRecord(name="ctl_skip", timestamp_us=1500.0, value=0)]
+        path = write_tracing_csv(records, output_dir=str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            row = list(csv.DictReader(f))[0]
+        assert row["value"] == "0"
+
+    def test_marker_without_value_is_written_empty(self, tmp_path):
+        records = [MarkerRecord(name="tick", timestamp_us=1500.0, value=None)]
+        path = write_tracing_csv(records, output_dir=str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            row = list(csv.DictReader(f))[0]
+        assert row["value"] == ""
+
+    def test_span_deadline_and_value_of_zero_are_written(self, tmp_path):
+        records = [
+            TraceEvent(
+                name="t", type="task", start_us=0.0, end_us=1.0,
+                priority=1, deadline_us=0.0, value=0,
+            ),
+        ]
+        path = write_tracing_csv(records, output_dir=str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            row = list(csv.DictReader(f))[0]
+        assert float(row["deadline_us"]) == pytest.approx(0.0)
+        assert row["value"] == "0"
+
+    def test_span_without_deadline_or_value_is_written_empty(self, tmp_path):
+        records = [
+            TraceEvent(name="t", type="task", start_us=0.0, end_us=1.0, priority=1),
+        ]
+        path = write_tracing_csv(records, output_dir=str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            row = list(csv.DictReader(f))[0]
+        assert row["deadline_us"] == ""
+        assert row["value"] == ""
+
     def test_symlink_updated(self, tmp_path):
         records = [
             TraceEvent(name="t", type="task", start_us=0.0, end_us=1.0, priority=1),

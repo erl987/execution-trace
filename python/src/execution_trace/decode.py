@@ -230,6 +230,12 @@ def write_tracing_csv(
     path = os.path.join(output_dir, filename)
     latest = os.path.join(output_dir, "trace_latest.csv")
 
+    # An optional column is empty only when the field is absent. Testing the value for
+    # truth instead would write 0 as empty, and zero is a legitimate payload: a reason
+    # code, a count of nothing, a deadline at the activation instant.
+    def _optional(field: float | int | None) -> float | int | str:
+        return "" if field is None else field
+
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["name", "type", "start_us", "end_us", "priority", "deadline_us", "value"])
@@ -238,13 +244,13 @@ def write_tracing_csv(
                 writer.writerow([
                     r.name, "marker",
                     r.timestamp_us, r.timestamp_us,
-                    0, "", r.value or "",
+                    0, "", _optional(r.value),
                 ])
             else:
                 writer.writerow([
                     r.name, r.type,
                     r.start_us, r.end_us,
-                    r.priority, r.deadline_us or "", r.value or "",
+                    r.priority, _optional(r.deadline_us), _optional(r.value),
                 ])
 
     # Atomically replace the symlink so trace_latest.csv always points to newest.
