@@ -1,18 +1,24 @@
-"""High-level decoder for execution-trace protobuf streams.
+"""High-level decoder for execution-trace protobuf streams (wire format v2).
 
 Receives raw bytes from any transport (RTT, UART, TCP, …), parses
-length-delimited :class:`TraceEvent` protobuf frames, matches
-``SPAN_START`` / ``SPAN_END`` pairs into :class:`TraceEvent` records,
-and records :class:`MarkerRecord` annotations directly.
+length-delimited :class:`tracing_pb2.TraceFrame` frames, matches
+``SPAN_START`` / ``SPAN_END`` pairs into :class:`TraceEvent` records, and
+records :class:`MarkerRecord` annotations directly.
+
+A v2 frame is **not** self-contained: its name is a dictionary id assigned by an
+earlier ``NAME_REGISTERED`` frame, and its timestamp is a delta against the
+previous frame. Both are resolved here rather than on the device, which is why
+:class:`TraceStreamState` carries the dictionary, the running clock and the
+sequence tracker across every frame of one connection.
 
 Typical usage::
 
     buf = bytearray()
-    tracker = SequenceTracker("tracing")
+    state = TraceStreamState("tracing")
     event_buffer = TraceEventBuffer()
 
     # ... fill buf from hardware ...
-    decode_tracing_stream(buf, tracker, event_buffer)
+    decode_tracing_stream(buf, state, event_buffer)
 
     csv_path = write_tracing_csv(
         event_buffer.records + event_buffer.markers,
@@ -31,6 +37,17 @@ from execution_trace._proto import tracing_pb2
 from execution_trace.stream import SequenceTracker, iter_frames
 
 logger = logging.getLogger(__name__)
+
+# The firmware's sequence counter wraps here rather than at 2**32: it exists only
+# to detect gaps, a gap is read modulo the wrap, and a full 32-bit counter would
+# spend up to five varint bytes per frame to buy nothing.
+SEQUENCE_MODULUS: int = 16_384
+
+# Reserved dictionary id, emitted when the device's name registry is full. The
+# stream stays decodable; the name of that one event is lost.
+UNKNOWN_NAME_ID: int = 0
+
+UNKNOWN_NAME: str = "<unknown>"
 
 
 @dataclass
@@ -77,6 +94,125 @@ class MarkerRecord:
     value: Optional[int] = None
 
 
+@dataclass
+class NameEntry:
+    """One dictionary entry: everything fixed by a span or marker name.
+
+    These attributes are sent once, on the ``NAME_REGISTERED`` frame that assigns
+    the id, rather than repeated on every occurrence of the event.
+
+    Attributes:
+        name: Task, ISR or marker label.
+        source_type: ``tracing_pb2.ISR`` or ``tracing_pb2.TASK``.
+        priority: Scheduler priority; 0 when the name was first seen on a frame
+            that carries no attributes (a ``SPAN_END`` or ``MARKER``).
+        relative_deadline_ms: Deadline relative to activation, or ``None``.
+    """
+
+    name: str
+    source_type: int = tracing_pb2.TRACE_EVENT_SOURCE_TYPE_UNSPECIFIED
+    priority: int = 0
+    relative_deadline_ms: Optional[float] = None
+
+
+class TraceStreamState:
+    """Per-connection decoder state for one v2 trace stream.
+
+    A v2 frame carries a dictionary id instead of a name and a delta instead of a
+    timestamp, so decoding is stateful: this holds the name dictionary, the
+    running clock the deltas accumulate into, the timebase declared by the
+    ``TRACE_START`` frame, and the sequence tracker that detects gaps and resets.
+
+    Create one per connection — the device's dictionary and clock both restart
+    when it does.
+
+    Args:
+        label: Human-readable stream name used in log messages.
+
+    Attributes:
+        source_mask: The source-group mask the firmware was built with, or
+            ``None`` until a ``TRACE_START`` frame arrives. A group absent from
+            the mask is silent by design, which is what distinguishes it from a
+            group whose frames were lost.
+    """
+
+    def __init__(self, label: str = "Trace event") -> None:
+        self.label = label
+        self.tracker = SequenceTracker(label, modulus=SEQUENCE_MODULUS)
+        self.names: dict[int, NameEntry] = {}
+        self.clock_ticks: int = 0
+        self.timebase: int = tracing_pb2.NANOSECONDS
+        self.core_frequency_hz: int = 0
+        self.source_mask: Optional[int] = None
+
+    def reset(self) -> None:
+        """Discard all per-stream state after a device reset.
+
+        The dictionary must go with it: the device reassigns ids from one on
+        reboot, so a stale entry would resolve a new id to the wrong name.
+        """
+        self.tracker = SequenceTracker(self.label, modulus=SEQUENCE_MODULUS)
+        self.names.clear()
+        self.clock_ticks = 0
+        self.timebase = tracing_pb2.NANOSECONDS
+        self.core_frequency_hz = 0
+        self.source_mask = None
+
+    def ticks_to_us(self, ticks: int) -> float:
+        """Convert a tick count to microseconds using the declared timebase.
+
+        Args:
+            ticks: A tick count in the unit the ``TRACE_START`` frame declared.
+
+        Returns:
+            The equivalent duration in microseconds.
+        """
+        if self.timebase == tracing_pb2.CYCLES and self.core_frequency_hz > 0:
+            return ticks * 1_000_000.0 / self.core_frequency_hz
+        return ticks / 1_000.0
+
+    def advance(self, frame: tracing_pb2.TraceFrame) -> float:
+        """Advance the stream clock by *frame* and return its absolute time in µs.
+
+        ``NAME_REGISTERED`` and ``TRACE_START`` frames carry an absolute
+        timestamp and re-establish the origin; every other frame carries a delta
+        against the frame before it.
+
+        Args:
+            frame: The decoded frame.
+
+        Returns:
+            The frame's absolute timestamp in microseconds.
+        """
+        if frame.event_type in (tracing_pb2.NAME_REGISTERED, tracing_pb2.TRACE_START):
+            self.clock_ticks = frame.timestamp_ticks
+        else:
+            self.clock_ticks += frame.timestamp_ticks
+        return self.ticks_to_us(self.clock_ticks)
+
+    def resolve(self, name_id: int) -> NameEntry:
+        """Look up a dictionary id.
+
+        Args:
+            name_id: The id carried by the frame.
+
+        Returns:
+            The registered entry, or a placeholder entry when the id is the
+            reserved "unknown" value or has not been registered — which happens
+            when the device's registry was full, or when the host attached after
+            the entry was sent.
+        """
+        entry = self.names.get(name_id)
+        if entry is not None:
+            return entry
+        if name_id != UNKNOWN_NAME_ID:
+            logger.warning(
+                "Tracing: name id %d was never registered — the host may have "
+                "attached mid-stream", name_id,
+            )
+        return NameEntry(name=UNKNOWN_NAME)
+
+
 class TraceEventBuffer:
     """Accumulates :class:`TraceEvent` records by matching ``SPAN_START`` / ``SPAN_END`` pairs.
 
@@ -87,49 +223,54 @@ class TraceEventBuffer:
     """
 
     def __init__(self) -> None:
-        # name → (timestamp_ns, source_type, priority, relative_deadline_ms)
-        self._pending: dict[str, tuple[int, int, int, Optional[float]]] = {}
+        # name → (start_us, NameEntry)
+        self._pending: dict[str, tuple[float, NameEntry]] = {}
         self._records: list[TraceEvent] = []
         self._markers: list[MarkerRecord] = []
 
-    def push(self, msg: tracing_pb2.TraceEvent) -> None:
-        """Process one decoded :class:`tracing_pb2.TraceEvent`.
+    def push(
+        self,
+        frame: tracing_pb2.TraceFrame,
+        entry: NameEntry,
+        timestamp_us: float,
+    ) -> None:
+        """Process one decoded frame whose name and timestamp are already resolved.
 
         Args:
-            msg: Decoded protobuf message from the firmware.
+            frame: The decoded frame, for its event type and marker value.
+            entry: The dictionary entry its ``name_id`` resolves to.
+            timestamp_us: Its absolute timestamp in microseconds.
         """
-        name = msg.name
-        if msg.event_type == tracing_pb2.SPAN_START:
+        name = entry.name
+        if frame.event_type == tracing_pb2.SPAN_START:
             if name in self._pending:
                 logger.warning("Tracing: duplicate START for '%s' — discarding previous", name)
-            relative_deadline_ms = msg.relative_deadline_ms if msg.HasField("relative_deadline_ms") else None
-            self._pending[name] = (msg.timestamp_ns, msg.source_type, int(msg.priority), relative_deadline_ms)
-        elif msg.event_type == tracing_pb2.SPAN_END:
+            self._pending[name] = (timestamp_us, entry)
+        elif frame.event_type == tracing_pb2.SPAN_END:
             if name not in self._pending:
                 logger.warning("Tracing: END for '%s' with no matching START — discarding", name)
                 return
-            start_ns, source_type, priority, relative_deadline_ms = self._pending.pop(name)
-            type_str = "isr" if source_type == tracing_pb2.ISR else "task"
-            start_us = start_ns / 1_000.0
-            deadline_us = start_us + relative_deadline_ms * 1_000.0 if relative_deadline_ms is not None else None
+            start_us, start_entry = self._pending.pop(name)
+            type_str = "isr" if start_entry.source_type == tracing_pb2.ISR else "task"
+            deadline_us = (
+                start_us + start_entry.relative_deadline_ms * 1_000.0
+                if start_entry.relative_deadline_ms is not None
+                else None
+            )
             self._records.append(
                 TraceEvent(
                     name=name,
                     type=type_str,
                     start_us=start_us,
-                    end_us=msg.timestamp_ns / 1_000.0,
-                    priority=priority,
+                    end_us=timestamp_us,
+                    priority=start_entry.priority,
                     deadline_us=deadline_us,
                 )
             )
-        elif msg.event_type == tracing_pb2.MARKER:
-            value = int(msg.marker_value) if msg.HasField("marker_value") else None
+        elif frame.event_type == tracing_pb2.MARKER:
+            value = int(frame.marker_value) if frame.HasField("marker_value") else None
             self._markers.append(
-                MarkerRecord(
-                    name=name,
-                    timestamp_us=msg.timestamp_ns / 1_000.0,
-                    value=value,
-                )
+                MarkerRecord(name=name, timestamp_us=timestamp_us, value=value)
             )
 
     def flush_pending(self) -> None:
@@ -156,31 +297,75 @@ class TraceEventBuffer:
 
 def decode_tracing_stream(
     buf: bytearray,
-    tracker: SequenceTracker,
+    state: TraceStreamState,
     event_buffer: TraceEventBuffer,
 ) -> None:
     """Decode all complete frames from *buf* and push events into *event_buffer*.
 
-    Consumes *buf* in-place. Stops and clears *buf* if a device reset is detected
-    (sequence number jumped backward), also calling :meth:`TraceEventBuffer.flush_pending`.
+    Consumes *buf* in-place. Resolves each frame's dictionary id and delta
+    timestamp against *state*, which must be the same object across every call
+    for one connection.
+
+    Stops and clears *buf* if a device reset is detected — either a backwards
+    sequence jump or a second ``TRACE_START`` frame — also resetting *state* and
+    calling :meth:`TraceEventBuffer.flush_pending`.
 
     Args:
         buf: Mutable byte buffer containing raw RTT / transport bytes.
-        tracker: Sequence number tracker shared across calls for the same stream.
+        state: Per-connection decoder state, shared across calls for one stream.
         event_buffer: Accumulator for decoded events.
     """
     for raw in iter_frames(buf):
-        msg = tracing_pb2.TraceEvent()
+        frame = tracing_pb2.TraceFrame()
         try:
-            msg.ParseFromString(raw)
+            frame.ParseFromString(raw)
         except Exception as exc:
-            logger.warning("Failed to decode TraceEvent: %s", exc)
+            logger.warning("Failed to decode TraceFrame: %s", exc)
             continue
-        if tracker.observe(msg.sequence):
+
+        # A TRACE_START after the stream is already running means the device
+        # rebooted: its dictionary and clock both restarted, so nothing carried
+        # over is still valid.
+        if frame.event_type == tracing_pb2.TRACE_START and state.source_mask is not None:
+            logger.warning("Tracing: TRACE_START mid-stream — device reset")
             buf.clear()
             event_buffer.flush_pending()
+            state.reset()
             break
-        event_buffer.push(msg)
+
+        if state.tracker.observe(frame.sequence):
+            buf.clear()
+            event_buffer.flush_pending()
+            state.reset()
+            break
+
+        timestamp_us = state.advance(frame)
+
+        if frame.event_type == tracing_pb2.TRACE_START:
+            state.timebase = frame.timebase
+            state.core_frequency_hz = frame.core_frequency_hz
+            state.source_mask = frame.source_mask
+            # The clock was set from the raw ticks before the timebase was known;
+            # it is a tick count either way, so only the conversion changes.
+            logger.info(
+                "Tracing: stream start, timebase=%s core=%d Hz source_mask=0x%02X",
+                tracing_pb2.TimeBase.Name(frame.timebase),
+                frame.core_frequency_hz,
+                frame.source_mask,
+            )
+        elif frame.event_type == tracing_pb2.NAME_REGISTERED:
+            state.names[frame.name_id] = NameEntry(
+                name=frame.name,
+                source_type=frame.source_type,
+                priority=int(frame.priority),
+                relative_deadline_ms=(
+                    frame.relative_deadline_ms
+                    if frame.HasField("relative_deadline_ms")
+                    else None
+                ),
+            )
+        else:
+            event_buffer.push(frame, state.resolve(frame.name_id), timestamp_us)
 
 
 def write_tracing_csv(

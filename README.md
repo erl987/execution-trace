@@ -61,50 +61,93 @@ fn ukf_step(sink: &mut impl TraceSink) {
 }
 ```
 
-### 3. Encode with sequence tracking
+### 3. Encode with `TraceEncoder`
 
-Use [`SequenceEncoder`] when encoding events manually so the host can detect dropped frames:
+[`TraceEncoder`] holds the three pieces of per-stream state the wire format needs: the name
+dictionary, the timestamp base the deltas are taken against, and the sequence counter that
+lets the host detect dropped frames. Emit the stream header once, then encode events:
 
 ```rust
-use execution_trace::{SequenceEncoder, SourceType, TraceEvent, encode::MAX_TRACE_FRAME_SIZE};
+use execution_trace::{SourceType, TraceEncoder, TraceEvent};
+use execution_trace::encode::{MAX_TRACE_BURST_SIZE, TimeBase};
+
+let mut enc = TraceEncoder::new();
+let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+
+// Once, at startup: declares the tick unit and the active source mask.
+if let Ok(n) = enc.encode_trace_start(0, TimeBase::Nanoseconds, 0, 0x1F, &mut buf) {
+    let _ = &buf[..n];
+}
 
 let mut name = heapless::String::<32>::new();
 name.push_str("my_task").unwrap();
 let event = TraceEvent::SpanStart {
-    timestamp_ns: 0,
+    timestamp_ns: 1_000,
     name,
     source_type: SourceType::Task,
     sequence: 0,
     priority: 4,
     relative_deadline_ms: None,
 };
-let mut enc = SequenceEncoder::new();
-let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
-if let Ok(n) = enc.encode(&event, &mut buf) {
-    // forward buf[..n] over your transport (RTT, UART, USB, etc.)
-    let _ = &buf[..n];
+if let Ok(encoded) = enc.encode(&event, &mut buf) {
+    if encoded.name_registry_full {
+        // The dictionary is full: the event went out with the reserved "unknown"
+        // id. Count it — the stream stays decodable, but this name is lost.
+    }
+    // forward buf[..encoded.len] over your transport (RTT, UART, USB, etc.)
+    let _ = &buf[..encoded.len];
 }
 ```
 
+The first sight of a name writes **two** frames — the dictionary entry, then the event — which
+is why the buffer is [`encode::MAX_TRACE_BURST_SIZE`] rather than one frame.
+
 ### 4. Decode on the host
 
+A frame is not self-contained: its name is a dictionary id and its timestamp is a delta against
+the previous frame. [`decode_trace_frame`] therefore returns a [`RawTraceFrame`], and the reader
+resolves both from state it carries across the stream:
+
 ```rust,ignore
-use execution_trace::encode::decode_trace_frame;
+use execution_trace::{FrameKind, encode::decode_trace_frame};
 
 // raw_bytes arrives from your transport (RTT, UART, file, etc.)
-let (event, consumed) = decode_trace_frame(raw_bytes).unwrap();
+let (frame, consumed) = decode_trace_frame(raw_bytes).unwrap();
+
+// A dictionary entry or the stream header carries an absolute timestamp and
+// re-establishes the origin; every other frame is a delta against it.
+clock = match frame.kind {
+    FrameKind::NameRegistered | FrameKind::TraceStart => frame.timestamp_ticks,
+    _ => clock + frame.timestamp_ticks,
+};
+if frame.kind == FrameKind::NameRegistered {
+    names.insert(frame.name_id, frame.name);
+}
 ```
+
+`examples/simulate.rs` carries a complete worked reader; the `execution-trace` Python package
+does the same job and renders a timing diagram from it.
 
 ## Wire format
 
 Each frame is a standard protobuf length-delimited record:
 
 ```text
-[ varint: payload byte count ][ protobuf-encoded TraceEvent ]
+[ varint: payload byte count ][ protobuf-encoded TraceFrame ]
 ```
 
-Maximum frame size is [`encode::MAX_TRACE_FRAME_SIZE`] (128 bytes). Name strings are capped at 32 bytes;
-longer names cause `record_*` to return [`TracingError::MessageDropped`] before sending.
+One flat message carries every frame class, discriminated by its `event_type`: the three
+per-occurrence events, the dictionary entry that assigns a name its id, and the stream header.
+proto3 omits unset fields, so an event pays nothing for the dictionary fields it does not use.
+
+A steady-state event costs **11-13 bytes** — the name, the priority and the deadline are sent
+once per name rather than on every occurrence, and the timestamp is a delta.
+
+Maximum frame size is [`encode::MAX_TRACE_FRAME_SIZE`] (128 bytes), and one `encode` call writes
+at most [`encode::MAX_TRACE_BURST_SIZE`]. Name strings are capped at 32 bytes; longer names cause
+`record_*` to return [`TracingError::MessageDropped`] before sending. The dictionary holds
+[`encode::NAME_REGISTRY_CAPACITY`] distinct names, after which events fall back to a reserved
+"unknown" id rather than to a wrong decode.
 
 ## Host-side tooling
 

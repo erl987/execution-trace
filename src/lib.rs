@@ -38,7 +38,7 @@ mod proto {
 }
 
 #[cfg(feature = "enabled")]
-pub use encode::SequenceEncoder;
+pub use encode::{FrameKind, RawTraceFrame, TimeBase, TraceEncoder};
 #[cfg(feature = "enabled")]
 pub use sink::TraceTransport;
 pub use sink::{NoopSink, TraceSink, TracingError};

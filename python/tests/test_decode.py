@@ -6,44 +6,62 @@ import os
 
 import pytest
 
+from conftest import StreamBuilder, make_frame
+
 from execution_trace._proto import tracing_pb2
 from execution_trace.decode import (
+    SEQUENCE_MODULUS,
+    UNKNOWN_NAME,
     MarkerRecord,
+    NameEntry,
     TraceEvent,
     TraceEventBuffer,
+    TraceStreamState,
     decode_tracing_stream,
     write_tracing_csv,
 )
-from execution_trace.stream import SequenceTracker, encode_varint
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_frame(
+def _push(
+    buf: TraceEventBuffer,
     event_type: int,
-    source_type: int,
     name: str,
-    timestamp_ns: int,
-    sequence: int = 0,
+    timestamp_us: float,
+    *,
+    source_type: int = tracing_pb2.TASK,
     priority: int = 0,
     relative_deadline_ms: float | None = None,
     marker_value: int | None = None,
-) -> bytes:
-    msg = tracing_pb2.TraceEvent()
-    msg.timestamp_ns = timestamp_ns
-    msg.name = name
-    msg.source_type = source_type
-    msg.event_type = event_type
-    msg.sequence = sequence
-    msg.priority = priority
-    if relative_deadline_ms is not None:
-        msg.relative_deadline_ms = relative_deadline_ms
+) -> None:
+    """Push one already-resolved event into *buf*.
+
+    `TraceEventBuffer.push` takes a frame plus the dictionary entry and absolute
+    timestamp the stream decoder resolved for it, so these unit tests supply
+    those directly rather than going through a stream.
+    """
+    frame = tracing_pb2.TraceFrame()
+    frame.event_type = event_type
     if marker_value is not None:
-        msg.marker_value = marker_value
-    raw = msg.SerializeToString()
-    return encode_varint(len(raw)) + raw
+        frame.marker_value = marker_value
+    entry = NameEntry(
+        name=name,
+        source_type=source_type,
+        priority=priority,
+        relative_deadline_ms=relative_deadline_ms,
+    )
+    buf.push(frame, entry, timestamp_us)
+
+
+def _decode(stream: bytearray) -> tuple[TraceStreamState, TraceEventBuffer]:
+    """Decode a whole stream and return the resulting state and buffer."""
+    state = TraceStreamState("test")
+    event_buffer = TraceEventBuffer()
+    decode_tracing_stream(stream, state, event_buffer)
+    return state, event_buffer
 
 
 # ---------------------------------------------------------------------------
@@ -53,19 +71,8 @@ def _make_frame(
 class TestTraceEventBuffer:
     def test_matches_start_end_pair(self):
         buf = TraceEventBuffer()
-        msg = tracing_pb2.TraceEvent()
-        msg.name = "task_a"
-        msg.event_type = tracing_pb2.SPAN_START
-        msg.source_type = tracing_pb2.TASK
-        msg.timestamp_ns = 1_000_000
-        msg.priority = 4
-        buf.push(msg)
-
-        msg2 = tracing_pb2.TraceEvent()
-        msg2.name = "task_a"
-        msg2.event_type = tracing_pb2.SPAN_END
-        msg2.timestamp_ns = 2_000_000
-        buf.push(msg2)
+        _push(buf, tracing_pb2.SPAN_START, "task_a", 1_000.0, priority=4)
+        _push(buf, tracing_pb2.SPAN_END, "task_a", 2_000.0)
 
         records = buf.records
         assert len(records) == 1
@@ -79,41 +86,30 @@ class TestTraceEventBuffer:
 
     def test_isr_source_type_sets_type_field(self):
         buf = TraceEventBuffer()
-        msg = tracing_pb2.TraceEvent()
-        msg.name = "gyro_isr"
-        msg.event_type = tracing_pb2.SPAN_START
-        msg.source_type = tracing_pb2.ISR
-        msg.timestamp_ns = 100
-        buf.push(msg)
-
-        msg2 = tracing_pb2.TraceEvent()
-        msg2.name = "gyro_isr"
-        msg2.event_type = tracing_pb2.SPAN_END
-        msg2.timestamp_ns = 200
-        buf.push(msg2)
-
+        _push(buf, tracing_pb2.SPAN_START, "gyro_isr", 0.1, source_type=tracing_pb2.ISR)
+        _push(buf, tracing_pb2.SPAN_END, "gyro_isr", 0.2)
         assert buf.records[0].type == "isr"
+
+    def test_span_attributes_come_from_the_start_not_the_end(self):
+        # In v2 only the dictionary carries priority and deadline, and a SPAN_END
+        # resolves to the same entry — but the record must be built from the
+        # entry seen at the START, which is the one the span was opened with.
+        buf = TraceEventBuffer()
+        _push(buf, tracing_pb2.SPAN_START, "t", 0.0, priority=7, relative_deadline_ms=1.0)
+        _push(buf, tracing_pb2.SPAN_END, "t", 500.0)
+        assert buf.records[0].priority == 7
+        assert buf.records[0].deadline_us == pytest.approx(1_000.0)
 
     def test_unmatched_end_discarded_and_logs(self, caplog):
         buf = TraceEventBuffer()
-        msg = tracing_pb2.TraceEvent()
-        msg.name = "ghost"
-        msg.event_type = tracing_pb2.SPAN_END
-        msg.timestamp_ns = 999
         with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
-            buf.push(msg)
+            _push(buf, tracing_pb2.SPAN_END, "ghost", 999.0)
         assert buf.records == []
         assert "no matching START" in caplog.text
 
     def test_marker_recorded_directly(self):
         buf = TraceEventBuffer()
-        msg = tracing_pb2.TraceEvent()
-        msg.name = "loop_tick"
-        msg.event_type = tracing_pb2.MARKER
-        msg.source_type = tracing_pb2.TASK
-        msg.timestamp_ns = 5_000_000
-        msg.marker_value = 7
-        buf.push(msg)
+        _push(buf, tracing_pb2.MARKER, "loop_tick", 5_000.0, marker_value=7)
 
         assert buf.records == []
         markers = buf.markers
@@ -127,40 +123,23 @@ class TestTraceEventBuffer:
 
     def test_marker_without_value_is_none(self):
         buf = TraceEventBuffer()
-        msg = tracing_pb2.TraceEvent()
-        msg.name = "tick"
-        msg.event_type = tracing_pb2.MARKER
-        msg.source_type = tracing_pb2.TASK
-        msg.timestamp_ns = 1_000
-        buf.push(msg)
+        _push(buf, tracing_pb2.MARKER, "tick", 1.0)
         assert buf.markers[0].value is None
+
+    def test_marker_value_of_zero_is_kept(self):
+        buf = TraceEventBuffer()
+        _push(buf, tracing_pb2.MARKER, "tick", 1.0, marker_value=0)
+        assert buf.markers[0].value == 0
 
     def test_relative_deadline_ms_converted_to_us(self):
         buf = TraceEventBuffer()
-        msg = tracing_pb2.TraceEvent()
-        msg.name = "t"
-        msg.event_type = tracing_pb2.SPAN_START
-        msg.source_type = tracing_pb2.TASK
-        msg.timestamp_ns = 0
-        msg.relative_deadline_ms = 2.5
-        buf.push(msg)
-
-        msg2 = tracing_pb2.TraceEvent()
-        msg2.name = "t"
-        msg2.event_type = tracing_pb2.SPAN_END
-        msg2.timestamp_ns = 1_000
-        buf.push(msg2)
-
+        _push(buf, tracing_pb2.SPAN_START, "t", 0.0, relative_deadline_ms=2.5)
+        _push(buf, tracing_pb2.SPAN_END, "t", 1.0)
         assert buf.records[0].deadline_us == pytest.approx(2_500.0)
 
     def test_flush_pending_warns_and_clears(self, caplog):
         buf = TraceEventBuffer()
-        msg = tracing_pb2.TraceEvent()
-        msg.name = "hanging_task"
-        msg.event_type = tracing_pb2.SPAN_START
-        msg.source_type = tracing_pb2.TASK
-        msg.timestamp_ns = 0
-        buf.push(msg)
+        _push(buf, tracing_pb2.SPAN_START, "hanging_task", 0.0)
 
         with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
             buf.flush_pending()
@@ -175,25 +154,66 @@ class TestTraceEventBuffer:
 
     def test_duplicate_start_warns_and_replaces(self, caplog):
         buf = TraceEventBuffer()
-        for ts in (100, 200):
-            msg = tracing_pb2.TraceEvent()
-            msg.name = "dup"
-            msg.event_type = tracing_pb2.SPAN_START
-            msg.source_type = tracing_pb2.TASK
-            msg.timestamp_ns = ts
-            with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
-                buf.push(msg)
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            _push(buf, tracing_pb2.SPAN_START, "dup", 0.1)
+            _push(buf, tracing_pb2.SPAN_START, "dup", 0.2)
+        _push(buf, tracing_pb2.SPAN_END, "dup", 0.3)
 
-        # The second START replaces the first; final END should use ts=200
-        msg = tracing_pb2.TraceEvent()
-        msg.name = "dup"
-        msg.event_type = tracing_pb2.SPAN_END
-        msg.source_type = tracing_pb2.TASK
-        msg.timestamp_ns = 300
-        buf.push(msg)
-
-        assert buf.records[0].start_us == pytest.approx(200.0 / 1_000)
+        assert buf.records[0].start_us == pytest.approx(0.2)
         assert "duplicate START" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# TraceStreamState
+# ---------------------------------------------------------------------------
+
+class TestTraceStreamState:
+    def test_nanosecond_ticks_convert_to_us(self):
+        state = TraceStreamState()
+        assert state.ticks_to_us(1_500) == pytest.approx(1.5)
+
+    def test_cycle_ticks_convert_using_the_core_frequency(self):
+        state = TraceStreamState()
+        state.timebase = tracing_pb2.CYCLES
+        state.core_frequency_hz = 72_000_000
+        # 72 000 cycles at 72 MHz is exactly 1 ms.
+        assert state.ticks_to_us(72_000) == pytest.approx(1_000.0)
+
+    def test_cycles_without_a_frequency_fall_back_to_nanoseconds(self):
+        # Rather than dividing by zero: a header that declares CYCLES but no
+        # frequency is malformed, and a wrong-but-finite scale is still readable.
+        state = TraceStreamState()
+        state.timebase = tracing_pb2.CYCLES
+        state.core_frequency_hz = 0
+        assert state.ticks_to_us(1_000) == pytest.approx(1.0)
+
+    def test_unregistered_id_resolves_to_a_placeholder_and_warns(self, caplog):
+        state = TraceStreamState()
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            entry = state.resolve(7)
+        assert entry.name == UNKNOWN_NAME
+        assert "never registered" in caplog.text
+
+    def test_the_reserved_unknown_id_resolves_silently(self, caplog):
+        # Id 0 means the device's registry was full. That is reported by a
+        # firmware fault counter, so the host need not warn per event.
+        state = TraceStreamState()
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            entry = state.resolve(0)
+        assert entry.name == UNKNOWN_NAME
+        assert caplog.text == ""
+
+    def test_reset_clears_the_dictionary(self):
+        # Ids restart at one on reboot, so a stale entry would resolve a new id
+        # to the wrong name.
+        state = TraceStreamState()
+        state.names[1] = NameEntry(name="old_task")
+        state.clock_ticks = 12345
+        state.source_mask = 0x1F
+        state.reset()
+        assert state.names == {}
+        assert state.clock_ticks == 0
+        assert state.source_mask is None
 
 
 # ---------------------------------------------------------------------------
@@ -201,27 +221,161 @@ class TestTraceEventBuffer:
 # ---------------------------------------------------------------------------
 
 class TestDecodeTracingStream:
-    def test_happy_path(self, sample_span_start_frame, sample_span_end_frame):
-        buf = bytearray(sample_span_start_frame + sample_span_end_frame)
-        tracker = SequenceTracker("test")
+    def test_happy_path(self, sample_stream):
+        state, event_buffer = _decode(sample_stream)
+        assert len(event_buffer.records) == 2
+        assert len(event_buffer.markers) == 1
+        assert sample_stream == bytearray()
+
+    def test_header_fields_reach_the_state(self):
+        stream = StreamBuilder().start(timestamp_ticks=1_000, source_mask=0x17).bytes()
+        state, _ = _decode(stream)
+        assert state.source_mask == 0x17
+        assert state.timebase == tracing_pb2.NANOSECONDS
+
+    def test_a_cycles_header_rescales_every_timestamp(self):
+        builder = StreamBuilder(timebase=tracing_pb2.CYCLES, core_frequency_hz=72_000_000)
+        builder.start(timestamp_ticks=0)
+        builder.span("t", 0, 72_000)  # 72 000 cycles at 72 MHz = 1 ms
+        state, event_buffer = _decode(builder.bytes())
+        assert state.core_frequency_hz == 72_000_000
+        assert event_buffer.records[0].end_us == pytest.approx(1_000.0)
+
+    def test_names_resolve_through_the_dictionary(self, sample_stream):
+        state, event_buffer = _decode(sample_stream)
+        assert {e.name for e in state.names.values()} == {"main_task", "gyro_isr", "loop_tick"}
+        assert [r.name for r in event_buffer.records] == ["main_task", "gyro_isr"]
+        assert event_buffer.markers[0].name == "loop_tick"
+
+    def test_a_name_is_registered_once_and_reused(self, builder):
+        builder.span("t", 0, 1_000)
+        builder.span("t", 2_000, 3_000)
+        state, event_buffer = _decode(builder.bytes())
+        assert len(state.names) == 1
+        assert len(event_buffer.records) == 2
+
+    def test_deltas_accumulate_into_absolute_timestamps(self, builder):
+        builder.span("main_task", 1_000_000, 2_000_000, priority=4)
+        builder.span("main_task", 5_000_000, 5_500_000)
+        _, event_buffer = _decode(builder.bytes())
+        spans = [(r.start_us, r.end_us) for r in event_buffer.records]
+        assert spans == [
+            pytest.approx((1_000.0, 2_000.0)),
+            pytest.approx((5_000.0, 5_500.0)),
+        ]
+
+    def test_attributes_are_carried_by_the_dictionary_not_the_event(self, builder):
+        builder.span(
+            "gyro_isr", 0, 400_000,
+            source_type=tracing_pb2.ISR, priority=8, relative_deadline_ms=1.0,
+        )
+        _, event_buffer = _decode(builder.bytes())
+        r = event_buffer.records[0]
+        assert r.type == "isr"
+        assert r.priority == 8
+        assert r.deadline_us == pytest.approx(1_000.0)
+
+    def test_an_unregistered_id_still_yields_a_decodable_marker(self, builder, caplog):
+        # What the firmware emits when its name registry is full: the event goes
+        # out with the reserved id rather than being dropped or mis-decoded.
+        builder.event(tracing_pb2.MARKER, "", 1_000, marker_value=5, name_id=0)
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            _, event_buffer = _decode(builder.bytes())
+        assert event_buffer.markers[0].name == UNKNOWN_NAME
+        assert event_buffer.markers[0].value == 5
+
+    def test_partial_frame_is_left_in_the_buffer(self, builder):
+        builder.span("t", 0, 1_000)
+        stream = builder.bytes()
+        head, tail = stream[:-2], stream[-2:]
+        state = TraceStreamState("test")
         event_buffer = TraceEventBuffer()
-        decode_tracing_stream(buf, tracker, event_buffer)
+        decode_tracing_stream(head, state, event_buffer)
+        assert len(head) > 0, "the incomplete frame must be kept for the next read"
+        assert event_buffer.records == []
+        # Feeding the rest completes the span.
+        head.extend(tail)
+        decode_tracing_stream(head, state, event_buffer)
         assert len(event_buffer.records) == 1
-        assert buf == bytearray()
+        assert head == bytearray()
 
-    def test_reset_detected_clears_buffer(self):
-        # Frame with sequence 1000 followed by sequence 0 (reset)
-        frame_high = _make_frame(tracing_pb2.SPAN_START, tracing_pb2.TASK, "t", 0, sequence=1000)
-        frame_reset = _make_frame(tracing_pb2.SPAN_START, tracing_pb2.TASK, "t", 0, sequence=0)
-        buf = bytearray(frame_high + frame_reset + b"\xaa\xbb")  # trailing garbage
-        tracker = SequenceTracker("test")
-        tracker.observe(999)  # pretend we've seen up to 999
+    def test_sequence_gap_is_reported(self, caplog):
+        stream = StreamBuilder().start().bytes()
+        # Skip a sequence number: the next frame claims 5, not 1.
+        stream += make_frame(tracing_pb2.MARKER, name_id=0, sequence=5)
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            _decode(stream)
+        assert "drop detected" in caplog.text
+
+    def test_sequence_wraps_at_the_modulus_without_a_false_reset(self, caplog):
+        state = TraceStreamState("test")
         event_buffer = TraceEventBuffer()
+        # Walk the tracker up to the last sequence before the wrap, then feed the
+        # wrapped frame. A u32 tracker would read 0 after 16383 as a huge jump.
+        state.tracker.observe(SEQUENCE_MODULUS - 1)
+        stream = bytearray(make_frame(tracing_pb2.MARKER, name_id=0, sequence=0))
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            decode_tracing_stream(stream, state, event_buffer)
+        assert caplog.text == ""
+        assert len(event_buffer.markers) == 1
 
-        decode_tracing_stream(buf, tracker, event_buffer)
+    def test_backwards_sequence_is_a_reset_that_clears_the_buffer(self):
+        state = TraceStreamState("test")
+        event_buffer = TraceEventBuffer()
+        state.tracker.observe(1_000)
+        state.names[1] = NameEntry(name="stale")
+        # Restarting at 0 from 1000 is an apparent forward jump of 15 383, more
+        # than half the modulus, so it reads as a backwards step: a reset.
+        stream = bytearray(make_frame(tracing_pb2.MARKER, name_id=1, sequence=0))
+        stream += b"\xaa\xbb"  # trailing garbage from the pre-reset stream
+        decode_tracing_stream(stream, state, event_buffer)
+        assert stream == bytearray()
+        assert state.names == {}
 
-        # buf is cleared on reset detection
-        assert buf == bytearray()
+    def test_a_reset_from_high_in_the_range_is_not_visible_in_the_sequence(self, caplog):
+        # A consequence of wrapping at 16 384 rather than 2**32: restarting at 0
+        # only looks backwards when the pre-reset counter was below half the
+        # modulus. From 9 000 it reads as an ordinary 7 383-frame gap, and the
+        # stale dictionary survives. This is why TRACE_START, not the sequence,
+        # is the reliable reset signal — see the test below.
+        state = TraceStreamState("test")
+        event_buffer = TraceEventBuffer()
+        state.tracker.observe(9_000)
+        state.names[1] = NameEntry(name="stale")
+        stream = bytearray(make_frame(tracing_pb2.MARKER, name_id=1, sequence=0))
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            decode_tracing_stream(stream, state, event_buffer)
+        assert "drop detected" in caplog.text
+        assert "reset" not in caplog.text
+        assert state.names == {1: NameEntry(name="stale")}
+
+    def test_a_second_header_is_treated_as_a_device_reset(self, caplog):
+        builder = StreamBuilder().start()
+        builder.span("t", 0, 1_000)
+        stream = builder.bytes()
+        state, event_buffer = _decode(stream)
+        assert len(state.names) == 1
+
+        # The device reboots: a fresh header arrives on the same connection, and
+        # its sequence restarts at 0 — which on its own is only a small backwards
+        # step, not the large one the tracker reads as a reset.
+        reboot = StreamBuilder().start(timestamp_ticks=0, source_mask=0x1F)
+        reboot.span("t", 0, 500)
+        buf = reboot.bytes()
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            decode_tracing_stream(buf, state, event_buffer)
+        assert "device reset" in caplog.text
+        assert state.names == {}
+        assert state.source_mask is None
+
+    def test_malformed_payload_is_skipped_without_killing_the_stream(self, caplog):
+        stream = StreamBuilder().start().bytes()
+        # A frame whose length prefix is right but whose payload is not a
+        # TraceFrame: field 1 declared as a length-delimited string.
+        stream += bytes([3, 0x0A, 0x7F, 0x7F])
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            _decode(stream)
+        assert stream == bytearray(), "the bad frame is consumed, not left to jam the buffer"
 
 
 # ---------------------------------------------------------------------------

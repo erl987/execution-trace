@@ -24,9 +24,12 @@ from typing import Generator
 
 logger = logging.getLogger(__name__)
 
-# A "drop" count exceeding half the u32 range means the sequence went backward —
+# The default counter width, for streams that carry a full 32-bit sequence.
+DEFAULT_MODULUS: int = 1 << 32
+
+# A "drop" count exceeding half the counter range means the sequence went backward —
 # a device reset rather than actual packet loss.
-RESET_THRESHOLD: int = 1 << 31
+RESET_THRESHOLD: int = DEFAULT_MODULUS >> 1
 
 
 class SequenceTracker:
@@ -40,17 +43,31 @@ class SequenceTracker:
 
     Args:
         label: Human-readable stream name used in log messages.
+        modulus: The value the counter wraps at. Defaults to the full 32-bit
+            range; the execution-trace v2 format wraps far earlier, at
+            :data:`execution_trace.decode.SEQUENCE_MODULUS`, because the counter
+            exists only to detect gaps and a gap is read modulo the wrap.
+
+    Raises:
+        ValueError: If *modulus* is not a positive power of two, which the
+            masking arithmetic below assumes.
     """
 
-    def __init__(self, label: str = "Frame") -> None:
+    def __init__(self, label: str = "Frame", modulus: int = DEFAULT_MODULUS) -> None:
+        if modulus <= 0 or modulus & (modulus - 1):
+            raise ValueError(f"modulus must be a positive power of two, got {modulus}")
         self._last: int | None = None
         self._label = label
+        self._modulus = modulus
+        self._mask = modulus - 1
+        # Half the range: a larger apparent forward jump is really a backward one.
+        self._reset_threshold = modulus >> 1
 
     def observe(self, sequence: int) -> bool:
         """Record a sequence number and detect resets or drops.
 
         Args:
-            sequence: The 32-bit sequence number from the received frame.
+            sequence: The sequence number from the received frame.
 
         Returns:
             ``True`` if a device reset was detected (sequence jumped backward),
@@ -61,14 +78,13 @@ class SequenceTracker:
             frame — whatever its sequence number — is accepted silently as the
             new baseline.
         """
-        # Use & 0xFFFFFFFF to emulate unsigned 32-bit counter math in Python
-        # (mod 2^32), so increment/subtraction behave correctly across counter
-        # wraparound.
+        # Mask to emulate the firmware's unsigned counter math in Python, so
+        # increment and subtraction behave correctly across a wraparound.
         if self._last is not None:
-            expected = (self._last + 1) & 0xFFFFFFFF
+            expected = (self._last + 1) & self._mask
             if sequence != expected:
-                dropped = (sequence - expected) & 0xFFFFFFFF
-                if dropped > RESET_THRESHOLD:
+                dropped = (sequence - expected) & self._mask
+                if dropped > self._reset_threshold:
                     logger.warning(
                         "%s: device reset detected, resuming from #%d",
                         self._label, sequence,

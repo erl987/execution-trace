@@ -17,10 +17,10 @@ from typing import NoReturn
 
 from execution_trace.decode import (
     TraceEventBuffer,
+    TraceStreamState,
     decode_tracing_stream,
     write_tracing_csv,
 )
-from execution_trace.stream import SequenceTracker
 
 
 def _die(msg: str) -> NoReturn:
@@ -60,9 +60,9 @@ def main() -> None:
     output_dir = args.output if args.output is not None else str(binary_path.parent)
 
     buf = bytearray(binary_path.read_bytes())
-    tracker = SequenceTracker("etrace-decode")
+    state = TraceStreamState("etrace-decode")
     event_buffer = TraceEventBuffer()
-    decode_tracing_stream(buf, tracker, event_buffer)
+    decode_tracing_stream(buf, state, event_buffer)
     event_buffer.flush_pending()
 
     records = event_buffer.records + event_buffer.markers

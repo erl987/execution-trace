@@ -7,26 +7,43 @@
 // diagram from it, run the companion Python script:
 //   python examples/visualize.py
 
-use execution_trace::encode::{MAX_TRACE_FRAME_SIZE, decode_trace_frame};
+use execution_trace::encode::{MAX_TRACE_BURST_SIZE, TimeBase, decode_trace_frame};
 use execution_trace::{
-    SequenceEncoder, SourceType, TraceEvent, TraceSink, TraceTransport, TracingError,
+    FrameKind, SourceType, TraceEncoder, TraceEvent, TraceSink, TraceTransport, TracingError,
 };
+use std::collections::HashMap;
 
 // A sink that encodes each event into a byte buffer that can be written to a file or
 // forwarded over a transport (RTT, UART, USB). On real hardware this would wrap the
 // transport driver; here it wraps a Vec<u8> so we can write the bytes to disk.
 struct FileSink {
     buf: Vec<u8>,
-    encoder: SequenceEncoder,
+    encoder: TraceEncoder,
     pub tick_ns: u64,
+    pub registry_full_events: u32,
 }
 
 impl FileSink {
     fn new() -> Self {
         Self {
             buf: Vec::new(),
-            encoder: SequenceEncoder::new(),
+            encoder: TraceEncoder::new(),
             tick_ns: 0,
+            registry_full_events: 0,
+        }
+    }
+
+    // Emits the stream header. On real hardware this runs once, from `init`.
+    fn write_header(&mut self, source_mask: u32) {
+        let mut frame = [0u8; MAX_TRACE_BURST_SIZE];
+        if let Ok(n) = self.encoder.encode_trace_start(
+            self.tick_ns,
+            TimeBase::Nanoseconds,
+            0,
+            source_mask,
+            &mut frame,
+        ) {
+            self.buf.extend_from_slice(&frame[..n]);
         }
     }
 
@@ -37,12 +54,19 @@ impl FileSink {
 
 impl TraceTransport for FileSink {
     fn write_event(&mut self, event: TraceEvent) -> Result<(), TracingError> {
-        let mut frame = [0u8; MAX_TRACE_FRAME_SIZE];
-        let n = self
+        // One call can write two frames: a first-sight name emits its dictionary
+        // entry ahead of the event, so the buffer is sized for the burst.
+        let mut frame = [0u8; MAX_TRACE_BURST_SIZE];
+        let encoded = self
             .encoder
             .encode(&event, &mut frame)
             .map_err(|_| TracingError::MessageDropped)?;
-        self.buf.extend_from_slice(&frame[..n]);
+        if encoded.name_registry_full {
+            // On hardware this increments the `TracingNameRegistryFull` fault:
+            // the stream stays decodable, but this event's name is lost.
+            self.registry_full_events += 1;
+        }
+        self.buf.extend_from_slice(&frame[..encoded.len]);
         Ok(())
     }
 }
@@ -55,6 +79,8 @@ impl TraceSink for FileSink {
 
 fn main() -> std::io::Result<()> {
     let mut sink = FileSink::new();
+    // Every group enabled; a real build passes the mask it was compiled with.
+    sink.write_header(0x1F);
 
     // --- Simulated timeline (nanosecond timestamps, two control-loop iterations) ---
     //
@@ -133,82 +159,99 @@ fn main() -> std::io::Result<()> {
     );
 
     // --- Decode and print each event (round-trip verification) ---
+    //
+    // v2 frames are not self-contained: a name is a dictionary id and a timestamp
+    // is a delta, so the reader carries the two pieces of per-stream state that
+    // resolve them. This is the same job the Python decoder does.
     println!("\nDecoded events:");
     println!(
         "{:<6} {:<14} {:<12} {:<10} {:<8} {}",
         "seq", "name", "type", "source", "ts_ms", "extras"
     );
     println!("{}", "-".repeat(72));
+
+    let mut names: HashMap<u32, (String, SourceType, Option<f32>)> = HashMap::new();
+    let mut clock_ns = 0u64;
     let mut pos = 0;
     while pos < bytes.len() {
         match decode_trace_frame(&bytes[pos..]) {
-            Ok((event, consumed)) => {
-                match &event {
-                    TraceEvent::SpanStart {
-                        sequence,
-                        name,
-                        source_type,
-                        timestamp_ns,
-                        relative_deadline_ms,
-                        ..
-                    } => {
-                        let ts_ms = *timestamp_ns as f64 / 1_000_000.0;
-                        let source = match source_type {
-                            SourceType::Isr => "ISR",
-                            SourceType::Task => "Task",
-                        };
-                        let mut extras = String::new();
-                        if let Some(dl) = relative_deadline_ms {
-                            extras.push_str(&format!("rel_deadline={dl:.1}ms "));
-                        }
+            Ok((frame, consumed)) => {
+                pos += consumed;
+
+                // A dictionary entry and the header carry an absolute timestamp
+                // and re-establish the origin; everything else is a delta.
+                clock_ns = match frame.kind {
+                    FrameKind::NameRegistered | FrameKind::TraceStart => frame.timestamp_ticks,
+                    _ => clock_ns + frame.timestamp_ticks,
+                };
+                let ts_ms = clock_ns as f64 / 1_000_000.0;
+
+                match frame.kind {
+                    FrameKind::TraceStart => {
                         println!(
-                            "{:<6} {:<14} {:<12} {:<10} {:<8.3} {}",
-                            sequence,
-                            name.as_str(),
-                            "SpanStart",
-                            source,
-                            ts_ms,
-                            extras,
-                        );
-                    }
-                    TraceEvent::SpanEnd {
-                        sequence,
-                        name,
-                        timestamp_ns,
-                    } => {
-                        let ts_ms = *timestamp_ns as f64 / 1_000_000.0;
-                        println!(
-                            "{:<6} {:<14} {:<12} {:<10} {:<8.3}",
-                            sequence,
-                            name.as_str(),
-                            "SpanEnd",
+                            "{:<6} {:<14} {:<12} {:<10} {:<8.3} mask=0x{:02X} timebase={:?}",
+                            frame.sequence,
+                            "-",
+                            "TraceStart",
                             "-",
                             ts_ms,
+                            frame.source_mask,
+                            frame.timebase,
                         );
                     }
-                    TraceEvent::Marker {
-                        sequence,
-                        name,
-                        timestamp_ns,
-                        marker_value,
-                    } => {
-                        let ts_ms = *timestamp_ns as f64 / 1_000_000.0;
-                        let mut extras = String::new();
-                        if let Some(v) = marker_value {
+                    FrameKind::NameRegistered => {
+                        let source = frame.source_type.unwrap_or(SourceType::Task);
+                        println!(
+                            "{:<6} {:<14} {:<12} {:<10} {:<8.3} id={}",
+                            frame.sequence,
+                            frame.name.as_str(),
+                            "NameReg",
+                            match source {
+                                SourceType::Isr => "ISR",
+                                SourceType::Task => "Task",
+                            },
+                            ts_ms,
+                            frame.name_id,
+                        );
+                        names.insert(
+                            frame.name_id,
+                            (
+                                frame.name.as_str().to_string(),
+                                source,
+                                frame.relative_deadline_ms,
+                            ),
+                        );
+                    }
+                    kind => {
+                        let (name, source, deadline) = match names.get(&frame.name_id) {
+                            Some(entry) => entry.clone(),
+                            // id 0: the registry was full when this was emitted.
+                            None => ("<unknown>".to_string(), SourceType::Task, None),
+                        };
+                        let (label, source_label, mut extras) = match kind {
+                            FrameKind::SpanStart => (
+                                "SpanStart",
+                                match source {
+                                    SourceType::Isr => "ISR",
+                                    SourceType::Task => "Task",
+                                },
+                                match deadline {
+                                    Some(dl) => format!("rel_deadline={dl:.1}ms "),
+                                    None => String::new(),
+                                },
+                            ),
+                            FrameKind::SpanEnd => ("SpanEnd", "-", String::new()),
+                            _ => ("Marker", "-", String::new()),
+                        };
+                        if let Some(v) = frame.marker_value {
                             extras.push_str(&format!("value={v}"));
                         }
                         println!(
                             "{:<6} {:<14} {:<12} {:<10} {:<8.3} {}",
-                            sequence,
-                            name.as_str(),
-                            "Marker",
-                            "-",
-                            ts_ms,
-                            extras,
+                            frame.sequence, name, label, source_label, ts_ms, extras,
                         );
                     }
                 }
-                pos += consumed;
             }
             Err(e) => {
                 eprintln!("decode error at byte {pos}: {e:?}");
