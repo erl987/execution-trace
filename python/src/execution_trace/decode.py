@@ -49,6 +49,16 @@ UNKNOWN_NAME_ID: int = 0
 
 UNKNOWN_NAME: str = "<unknown>"
 
+# How far the device clock must appear to jump *backwards* on a TRACE_START
+# before it is read as a reboot rather than as ordering jitter.
+#
+# A reboot restarts the clock at zero, so it shows up as the whole uptime — many
+# seconds. Jitter is microseconds: the header's timestamp is read after the
+# producer queue is drained, but an event recorded just before that read can
+# still be encoded after it. Treating a microsecond inversion as a reboot would
+# throw the dictionary away and blind the trace for a whole refresh interval.
+RESET_BACKWARD_MARGIN_US: float = 1_000_000.0
+
 
 @dataclass
 class TraceEvent:
@@ -140,6 +150,8 @@ class TraceStreamState:
         self.label = label
         self.tracker = SequenceTracker(label, modulus=SEQUENCE_MODULUS)
         self.names: dict[int, NameEntry] = {}
+        #: Reconstructed device time, in ticks. Signed, because a frame's delta
+        #: can be negative — see the `timestamp_ticks` field comment in the proto.
         self.clock_ticks: int = 0
         self.timebase: int = tracing_pb2.NANOSECONDS
         self.core_frequency_hz: int = 0
@@ -319,9 +331,11 @@ def decode_tracing_stream(
     timestamp against *state*, which must be the same object across every call
     for one connection.
 
-    Stops and clears *buf* if a device reset is detected — either a backwards
-    sequence jump or a second ``TRACE_START`` frame — also resetting *state* and
-    calling :meth:`TraceEventBuffer.flush_pending`.
+    On a detected device reset, resets *state* and calls
+    :meth:`TraceEventBuffer.flush_pending`, then carries on parsing. It does
+    **not** discard *buf*: the stream is length-prefixed with no sync marker, so
+    dropping bytes mid-frame leaves every following frame misaligned and
+    unrecoverable.
 
     Args:
         buf: Mutable byte buffer containing raw RTT / transport bytes.
@@ -336,27 +350,36 @@ def decode_tracing_stream(
             logger.warning("Failed to decode TraceFrame: %s", exc)
             continue
 
+        # A device reset invalidates everything carried over: the dictionary is
+        # reassigned from id one and the clock restarts at zero, so a stale entry
+        # would resolve a new id to an old name. Two things reveal one.
+        #
         # The device re-emits the header periodically so that a host attaching
-        # mid-run learns the timebase and the mask. That is not a reset — only a
-        # header whose absolute timestamp has gone *backwards* is, because the
-        # device clock restarts at zero on reboot and nothing carried over from
-        # before it is still valid.
-        if (
+        # mid-run learns the timebase and the mask, so a header alone is not a
+        # reset — only one whose absolute timestamp has gone *far* backwards,
+        # which separates a reboot from ordering jitter (RESET_BACKWARD_MARGIN_US).
+        clock_restarted = (
             frame.event_type == tracing_pb2.TRACE_START
             and state.source_mask is not None
-            and frame.timestamp_ticks < state.clock_ticks
-        ):
-            logger.warning("Tracing: device clock restarted — device reset")
-            buf.clear()
+            and state.ticks_to_us(state.clock_ticks - frame.timestamp_ticks)
+            > RESET_BACKWARD_MARGIN_US
+        )
+        if clock_restarted or state.tracker.observe(frame.sequence):
+            if clock_restarted:
+                logger.warning("Tracing: device clock restarted — device reset")
             event_buffer.flush_pending()
             state.reset()
-            break
-
-        if state.tracker.observe(frame.sequence):
-            buf.clear()
-            event_buffer.flush_pending()
-            state.reset()
-            break
+            # Seed the fresh tracker from this frame so gap detection is exact
+            # from the reset onward rather than from the frame after it.
+            state.tracker.observe(frame.sequence)
+            # Then fall through and process this frame: it is the first frame of
+            # the new run — often the reboot's own header, carrying the timebase
+            # and mask — and skipping it would leave the stream unattributed
+            # until the next refresh.
+            #
+            # Deliberately no `buf.clear()`: the frames after this point are
+            # intact and correctly delimited, and discarding bytes mid-frame
+            # would misalign the rest of the stream permanently.
 
         timestamp_us = state.advance(frame)
 

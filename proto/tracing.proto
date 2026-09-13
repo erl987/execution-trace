@@ -17,9 +17,15 @@ message TraceFrame {
   // by the TRACE_START frame. Absolute, not a delta, on NAME_REGISTERED and
   // TRACE_START frames, which re-establish the time origin (§5.6).
   //
-  // Declared 64-bit so that an idle stream cannot overflow it; a varint costs
-  // the same for the small values this normally carries.
-  uint64 timestamp_ticks = 1;
+  // **Signed**, because the delta can be negative: an event is timestamped when
+  // it is recorded, before it reaches the producer queue, so a high-priority ISR
+  // preempting a task between those two points puts a later timestamp ahead of
+  // an earlier one in drain order. Clamping such an inversion to zero would make
+  // the host's reconstructed clock drift permanently ahead of the device's
+  // (§19.10). Zigzag encoding costs no extra byte at the magnitudes seen here.
+  //
+  // Declared 64-bit so that an idle stream cannot overflow it.
+  sint64 timestamp_ticks = 1;
 
   // Dictionary key assigned by NAME_REGISTERED. Id 0 is reserved for "unknown",
   // emitted when the registry is full (§5.5, REQ-T11).

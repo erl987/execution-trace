@@ -83,7 +83,11 @@ pub struct RawTraceFrame {
     /// A delta against the previous sequenced frame, except on
     /// [`FrameKind::NameRegistered`] and [`FrameKind::TraceStart`], where it is
     /// absolute and re-establishes the time origin.
-    pub timestamp_ticks: u64,
+    ///
+    /// Signed: the delta is negative whenever an event was recorded before the
+    /// one encoded ahead of it, which happens whenever an ISR preempts a task
+    /// between its timestamp being taken and its being queued (§19.10).
+    pub timestamp_ticks: i64,
     pub name_id: u32,
     pub kind: FrameKind,
     pub sequence: u32,
@@ -106,7 +110,7 @@ pub struct RawTraceFrame {
 }
 
 impl RawTraceFrame {
-    fn new(kind: FrameKind, timestamp_ticks: u64, sequence: u32, name_id: u32) -> Self {
+    fn new(kind: FrameKind, timestamp_ticks: i64, sequence: u32, name_id: u32) -> Self {
         Self {
             timestamp_ticks,
             name_id,
@@ -200,7 +204,7 @@ impl TraceEncoder {
     ) -> Result<usize, TracingEncodeError> {
         let mut frame = RawTraceFrame::new(
             FrameKind::TraceStart,
-            timestamp_ticks,
+            Self::absolute(timestamp_ticks),
             self.next_sequence(),
             UNKNOWN_NAME_ID,
         );
@@ -259,7 +263,10 @@ impl TraceEncoder {
             },
         };
 
-        let delta = timestamp_ns.saturating_sub(self.last_ticks);
+        // Signed: a negative delta is an event that was recorded before the one
+        // encoded ahead of it. Clamping it to zero while still moving the base
+        // backwards would leave the host's clock permanently ahead (§19.10).
+        let delta = Self::absolute(timestamp_ns) - Self::absolute(self.last_ticks);
         self.last_ticks = timestamp_ns;
         let sequence = self.next_sequence();
 
@@ -360,7 +367,7 @@ impl TraceEncoder {
         let sequence = self.next_sequence();
         let mut frame = RawTraceFrame::new(
             FrameKind::NameRegistered,
-            timestamp_ticks,
+            Self::absolute(timestamp_ticks),
             sequence,
             name_id,
         );
@@ -406,7 +413,12 @@ impl TraceEncoder {
         let id = u32::try_from(self.names.len()).map_err(|_| RegisterError::Full)?;
 
         let sequence = self.next_sequence();
-        let mut frame = RawTraceFrame::new(FrameKind::NameRegistered, timestamp_ns, sequence, id);
+        let mut frame = RawTraceFrame::new(
+            FrameKind::NameRegistered,
+            Self::absolute(timestamp_ns),
+            sequence,
+            id,
+        );
         frame.name = name.clone();
         frame.source_type = source_type;
         frame.priority = priority;
@@ -415,6 +427,16 @@ impl TraceEncoder {
 
         let n = encode_trace_frame(&frame, out).map_err(RegisterError::Encode)?;
         Ok((id, n))
+    }
+
+    /// Device timestamps as the wire carries them.
+    ///
+    /// Saturating rather than wrapping: at nanosecond ticks `i64::MAX` is 292
+    /// years of uptime and at cycles it is further still, so this cannot be
+    /// reached in practice — but a wrap would desynchronise the host's clock for
+    /// good, where a saturation only stops it advancing.
+    fn absolute(ticks: u64) -> i64 {
+        i64::try_from(ticks).unwrap_or(i64::MAX)
     }
 
     fn next_sequence(&mut self) -> u32 {
@@ -893,25 +915,51 @@ mod tests {
             let (b, _) = encode_one(&mut enc, &span_end("a", ts));
             bytes.extend_from_slice(&b);
         }
-        let mut clock = 0u64;
+        let mut clock = 0i64;
         let reconstructed: Vec<u64> = decode_all(&bytes)
             .iter()
             .map(|f| {
                 clock += f.timestamp_ticks;
-                clock
+                u64::try_from(clock).unwrap()
             })
             .collect();
         assert_eq!(reconstructed, stamps);
     }
 
     #[test]
-    fn a_backwards_timestamp_saturates_rather_than_wrapping() {
-        // Cannot happen with a monotonic clock, but a delta of ~2^64 would be
-        // five varint bytes and would desynchronise the host's clock for good.
+    fn a_backwards_timestamp_is_encoded_as_a_negative_delta() {
+        // An event recorded before the one encoded ahead of it: the timestamp is
+        // taken before the event reaches the producer queue, so an ISR preempting
+        // a task in between reorders them. The delta has to carry the inversion,
+        // not clamp it (§19.10).
         let mut enc = warmed(&["a"]);
         encode_one(&mut enc, &span_end("a", 10_000));
         let (bytes, _) = encode_one(&mut enc, &span_end("a", 9_000));
-        assert_eq!(decode_all(&bytes)[0].timestamp_ticks, 0);
+        assert_eq!(decode_all(&bytes)[0].timestamp_ticks, -1_000);
+    }
+
+    #[test]
+    fn out_of_order_timestamps_do_not_drift_the_reconstructed_clock() {
+        // The recording layer timestamps an event before it reaches the queue, so
+        // a priority-8 ISR preempting a task between those two points puts a
+        // *later* timestamp ahead of an earlier one in drain order. The
+        // reconstructed clock must still track the device, or it runs ahead and a
+        // later absolute timestamp looks like the device clock went backwards.
+        let mut enc = warmed(&["a"]);
+        let mut wire = Vec::new();
+        // 100, then an inverted 90, then 110 — one preemption.
+        for ts in [100_000u64, 90_000, 110_000] {
+            let (bytes, _) = encode_one(&mut enc, &span_end("a", ts));
+            wire.extend_from_slice(&bytes);
+        }
+        let mut clock = 0i64;
+        for frame in decode_all(&wire) {
+            clock += frame.timestamp_ticks;
+        }
+        assert_eq!(
+            clock, 110_000,
+            "the reconstructed clock must land on the last timestamp, not past it"
+        );
     }
 
     // ── Sequencing (§18.1) ────────────────────────────────────────────────────
@@ -1307,9 +1355,9 @@ mod tests {
         // Host side: resolve ids through the dictionary, accumulate the deltas.
         let mut dictionary: std::collections::HashMap<u32, std::string::String> =
             std::collections::HashMap::new();
-        let mut clock = 0u64;
+        let mut clock = 0i64;
         let mut expect_sequence = 0u32;
-        let mut resolved: Vec<(std::string::String, u64, FrameKind)> = Vec::new();
+        let mut resolved: Vec<(std::string::String, i64, FrameKind)> = Vec::new();
 
         for frame in decode_all(&wire) {
             assert_eq!(frame.sequence, expect_sequence, "no gaps in a clean stream");

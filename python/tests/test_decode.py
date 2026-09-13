@@ -10,6 +10,7 @@ from conftest import StreamBuilder, make_frame
 
 from execution_trace._proto import tracing_pb2
 from execution_trace.decode import (
+    RESET_BACKWARD_MARGIN_US,
     SEQUENCE_MODULUS,
     UNKNOWN_NAME,
     MarkerRecord,
@@ -332,7 +333,7 @@ class TestDecodeTracingStream:
         assert caplog.text == ""
         assert len(event_buffer.markers) == 1
 
-    def test_backwards_sequence_is_a_reset_that_clears_the_buffer(self):
+    def test_backwards_sequence_is_a_reset_that_clears_the_dictionary(self):
         state = TraceStreamState("test")
         event_buffer = TraceEventBuffer()
         state.tracker.observe(1_000)
@@ -340,10 +341,31 @@ class TestDecodeTracingStream:
         # Restarting at 0 from 1000 is an apparent forward jump of 15 383, more
         # than half the modulus, so it reads as a backwards step: a reset.
         stream = bytearray(make_frame(tracing_pb2.MARKER, name_id=1, sequence=0))
-        stream += b"\xaa\xbb"  # trailing garbage from the pre-reset stream
         decode_tracing_stream(stream, state, event_buffer)
-        assert stream == bytearray()
-        assert state.names == {}
+        assert state.names == {}, "a stale entry would resolve new ids to old names"
+
+    def test_a_reset_does_not_discard_the_byte_buffer(self):
+        # The stream is length-prefixed with no sync marker, so dropping bytes
+        # mid-frame misaligns everything after it permanently — which showed up
+        # on hardware as a burst of "Failed to decode TraceFrame" immediately
+        # after every reset (§19.10).
+        state = TraceStreamState("test")
+        event_buffer = TraceEventBuffer()
+        state.tracker.observe(1_000)
+        state.names[1] = NameEntry(name="stale")
+
+        stream = bytearray(make_frame(tracing_pb2.MARKER, name_id=1, sequence=0))
+        # A complete, well-formed frame arriving after the reset point.
+        stream += make_frame(
+            tracing_pb2.NAME_REGISTERED, name_id=1, sequence=1, name="fresh",
+            source_type=tracing_pb2.TASK,
+        )
+        stream += make_frame(tracing_pb2.MARKER, name_id=1, sequence=2, marker_value=9)
+        decode_tracing_stream(stream, state, event_buffer)
+
+        assert stream == bytearray(), "every complete frame is still consumed"
+        assert state.names[1].name == "fresh", "frames after the reset still parse"
+        assert [m.value for m in event_buffer.markers] == [9]
 
     def test_a_reset_from_high_in_the_range_is_not_visible_in_the_sequence(self, caplog):
         # A consequence of wrapping at 16 384 rather than 2**32: restarting at 0
@@ -416,24 +438,49 @@ class TestDecodeTracingStream:
         assert "reset" not in caplog.text
         assert len(state.names) == 1, "the dictionary must survive a refresh"
 
+    def test_a_header_slightly_behind_the_clock_is_not_a_reset(self, caplog):
+        # The header's timestamp is read after the producer queue is drained, but
+        # an event recorded just before that read can still be encoded after it,
+        # putting the header microseconds behind the reconstructed clock. Reading
+        # that as a reboot would discard the dictionary every refresh (§19.10).
+        builder = StreamBuilder().start(timestamp_ticks=1_000)
+        builder.span("t", 2_000_000, 3_000_000)
+        state, event_buffer = _decode(builder.bytes())
+        assert len(state.names) == 1
+
+        behind = bytearray(
+            make_frame(
+                tracing_pb2.TRACE_START,
+                timestamp_ticks=state.clock_ticks - 300_000,  # 300 µs behind
+                sequence=state.tracker._last + 1,
+                source_mask=0x1F,
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            decode_tracing_stream(behind, state, event_buffer)
+        assert "reset" not in caplog.text
+        assert len(state.names) == 1
+
     def test_a_second_header_is_treated_as_a_device_reset(self, caplog):
-        builder = StreamBuilder().start()
-        builder.span("t", 0, 1_000)
+        # A real device has been up for seconds before it reboots, so the clock
+        # drops by its whole uptime — far past RESET_BACKWARD_MARGIN_US.
+        builder = StreamBuilder().start(timestamp_ticks=30_000_000_000)
+        builder.span("t", 30_001_000_000, 30_002_000_000)
         stream = builder.bytes()
         state, event_buffer = _decode(stream)
         assert len(state.names) == 1
 
-        # The device reboots: a fresh header arrives on the same connection, and
-        # its sequence restarts at 0 — which on its own is only a small backwards
-        # step, not the large one the tracker reads as a reset.
         reboot = StreamBuilder().start(timestamp_ticks=0, source_mask=0x1F)
         reboot.span("t", 0, 500)
         buf = reboot.bytes()
         with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
             decode_tracing_stream(buf, state, event_buffer)
         assert "device reset" in caplog.text
-        assert state.names == {}
-        assert state.source_mask is None
+        # The pre-reboot dictionary is gone, and the reboot's own frames — which
+        # follow in the same buffer — are parsed rather than thrown away.
+        assert state.names[1].name == "t"
+        assert state.source_mask == 0x1F
+        assert buf == bytearray()
 
     def test_malformed_payload_is_skipped_without_killing_the_stream(self, caplog):
         stream = StreamBuilder().start().bytes()

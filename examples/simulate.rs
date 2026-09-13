@@ -171,7 +171,9 @@ fn main() -> std::io::Result<()> {
     println!("{}", "-".repeat(72));
 
     let mut names: HashMap<u32, (String, SourceType, Option<f32>)> = HashMap::new();
-    let mut clock_ns = 0u64;
+    // Signed: a frame's delta is negative when an event was recorded before the
+    // one encoded ahead of it.
+    let mut clock_ns = 0i64;
     let mut pos = 0;
     while pos < bytes.len() {
         match decode_trace_frame(&bytes[pos..]) {
