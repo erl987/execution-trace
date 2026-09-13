@@ -7,7 +7,7 @@
 // diagram from it, run the companion Python script:
 //   python examples/visualize.py
 
-use execution_trace::encode::{MAX_TRACE_BURST_SIZE, TimeBase, decode_trace_frame};
+use execution_trace::encode::{MAX_TRACE_BURST_SIZE, decode_trace_frame};
 use execution_trace::{
     FrameKind, SourceType, TraceEncoder, TraceEvent, TraceSink, TraceTransport, TracingError,
 };
@@ -36,13 +36,10 @@ impl FileSink {
     // Emits the stream header. On real hardware this runs once, from `init`.
     fn write_header(&mut self, source_mask: u32) {
         let mut frame = [0u8; MAX_TRACE_BURST_SIZE];
-        if let Ok(n) = self.encoder.encode_trace_start(
-            self.tick_ns,
-            TimeBase::Nanoseconds,
-            0,
-            source_mask,
-            &mut frame,
-        ) {
+        if let Ok(n) = self
+            .encoder
+            .encode_trace_start(self.tick_ns, source_mask, &mut frame)
+        {
             self.buf.extend_from_slice(&frame[..n]);
         }
     }
@@ -72,7 +69,7 @@ impl TraceTransport for FileSink {
 }
 
 impl TraceSink for FileSink {
-    fn get_elapsed_nanoseconds(&self) -> u64 {
+    fn now_ticks(&self) -> u64 {
         self.tick_ns
     }
 }

@@ -52,7 +52,7 @@ pub trait TraceTransport {
 /// `TraceSink` operates in two layers:
 ///
 /// 1. **Recording layer** — `record_span_start`, `record_span_end`, and `record_marker`
-///    read the hardware clock via `get_elapsed_nanoseconds`, construct [`TraceEvent`]s
+///    read the hardware clock via `now_ticks`, construct [`TraceEvent`]s
 ///    (sequence left at zero), and hand them to [`TraceTransport::write_event`].
 /// 2. **Transport layer** — code that owns the wire (e.g. [`crate::SequenceEncoder`]) injects a
 ///    monotonic sequence counter before writing bytes to RTT, UART, etc. The sequence
@@ -61,12 +61,44 @@ pub trait TraceTransport {
 /// For tests or placeholders, use [`NoopSink`], which discards all events at zero cost.
 #[cfg(feature = "enabled")]
 pub trait TraceSink: TraceTransport {
-    /// Returns the current monotonic time in nanoseconds.
+    /// Returns the current time as a tick count.
+    ///
+    /// The unit is whatever the encoder for this stream declares on its header
+    /// — nanoseconds by default, or raw core cycles for a sink using
+    /// [`TraceEncoder::with_cycle_counter`]. A cycle source may be a
+    /// free-running 32-bit counter returned widened: the encoder extends it, so
+    /// that this can be a single volatile load with no critical section and no
+    /// division on the path an ISR takes (EXEC-TRACE-002 §5.8).
     ///
     /// This method has no default — every `TraceSink` implementor must wire up a real clock
     /// source. Returning a constant `0` is valid for stubs, but must be done explicitly to
     /// avoid silent zero timestamps in production code.
-    fn get_elapsed_nanoseconds(&self) -> u64;
+    ///
+    /// [`TraceEncoder::with_cycle_counter`]: crate::TraceEncoder::with_cycle_counter
+    fn now_ticks(&self) -> u64;
+
+    /// How many ticks make a microsecond in this sink's timebase.
+    ///
+    /// Defaults to a nanosecond tick. A sink returning core cycles reports its
+    /// core clock in MHz — 72 on this target. Used to turn a measured interval
+    /// into the microseconds a marker payload carries.
+    fn ticks_per_us(&self) -> u32 {
+        1_000
+    }
+
+    /// The significant bits of [`now_ticks`](TraceSink::now_ticks).
+    ///
+    /// Defaults to the full 64 bits. A sink returning a free-running 32-bit
+    /// counter reports `u32::MAX`, so that an interval measured across the
+    /// counter's wrap still comes out right.
+    fn tick_mask(&self) -> u64 {
+        u64::MAX
+    }
+
+    /// Ticks elapsed from `started` to now, correct across a counter wrap.
+    fn ticks_since(&self, started: u64) -> u64 {
+        self.now_ticks().wrapping_sub(started) & self.tick_mask()
+    }
 
     /// Records the start of a named execution span.
     ///
@@ -94,7 +126,7 @@ pub trait TraceSink: TraceTransport {
         name.push_str(source_name)
             .map_err(|_| TracingError::MessageDropped)?;
         let mut event = TraceEvent::SpanStart {
-            timestamp_ns: self.get_elapsed_nanoseconds(),
+            timestamp_ns: self.now_ticks(),
             name,
             source_type,
             sequence: 0,
@@ -124,7 +156,7 @@ pub trait TraceSink: TraceTransport {
         name.push_str(source_name)
             .map_err(|_| TracingError::MessageDropped)?;
         let mut event = TraceEvent::SpanEnd {
-            timestamp_ns: self.get_elapsed_nanoseconds(),
+            timestamp_ns: self.now_ticks(),
             name,
             sequence: 0,
         };
@@ -152,7 +184,7 @@ pub trait TraceSink: TraceTransport {
         name.push_str(label)
             .map_err(|_| TracingError::MessageDropped)?;
         let mut event = TraceEvent::Marker {
-            timestamp_ns: self.get_elapsed_nanoseconds(),
+            timestamp_ns: self.now_ticks(),
             name,
             sequence: 0,
             marker_value: value,
@@ -213,7 +245,7 @@ impl TraceTransport for NoopSink {
 
 #[cfg(feature = "enabled")]
 impl TraceSink for NoopSink {
-    fn get_elapsed_nanoseconds(&self) -> u64 {
+    fn now_ticks(&self) -> u64 {
         0
     }
 }
@@ -254,7 +286,7 @@ mod tests {
     }
 
     impl TraceSink for CaptureSink {
-        fn get_elapsed_nanoseconds(&self) -> u64 {
+        fn now_ticks(&self) -> u64 {
             self.timestamp_ns
         }
     }
@@ -268,7 +300,7 @@ mod tests {
     }
 
     impl TraceSink for ErrorSink {
-        fn get_elapsed_nanoseconds(&self) -> u64 {
+        fn now_ticks(&self) -> u64 {
             0
         }
     }

@@ -145,8 +145,62 @@ impl RawTraceFrame {
 /// [`TraceSink`]: crate::TraceSink
 pub struct TraceEncoder {
     names: heapless::Vec<DictionaryEntry, NAME_REGISTRY_CAPACITY>,
-    last_ticks: u64,
+    clock: TickClock,
+    /// Extended tick count of the frame emitted most recently, which the next
+    /// frame's delta is taken against.
+    last_emitted: i64,
     sequence: u32,
+}
+
+/// Turns the readings a sink produces into the monotonic tick count the wire
+/// carries.
+///
+/// The distinction exists because a raw hardware cycle counter is 32 bits and
+/// free-running. Extending it to 64 is bookkeeping, and §5.8's whole point is
+/// that the ISR recording an event must not pay for it — so it happens here, in
+/// the task that owns the transport, off the control path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickWidth {
+    /// Readings are already a 64-bit monotonic count and are used as given.
+    Monotonic64,
+    /// Readings are a free-running 32-bit counter that wraps.
+    Wrapping32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TickClock {
+    width: TickWidth,
+    timebase: TimeBase,
+    core_frequency_hz: u32,
+    last_raw: u64,
+    absolute: i64,
+    started: bool,
+}
+
+impl TickClock {
+    /// Folds a raw reading into the extended, absolute tick count.
+    ///
+    /// For a wrapping source the step is taken in the counter's own 32-bit
+    /// arithmetic and read as signed, which handles both the wrap — every
+    /// 59.65 s at 72 MHz — and the small backwards steps that ISR preemption
+    /// produces (§19.10), without telling them apart or needing to. The only
+    /// assumption is that consecutive readings are less than half a wrap apart;
+    /// the dictionary refresh reads the clock every 2 s, so nothing else has to
+    /// guarantee it.
+    fn extend(&mut self, raw: u64) -> i64 {
+        match self.width {
+            TickWidth::Monotonic64 => self.absolute = i64::try_from(raw).unwrap_or(i64::MAX),
+            TickWidth::Wrapping32 if self.started => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let step = i64::from((raw as u32).wrapping_sub(self.last_raw as u32) as i32);
+                self.absolute = self.absolute.wrapping_add(step);
+            }
+            TickWidth::Wrapping32 => self.absolute = i64::try_from(raw).unwrap_or(i64::MAX),
+        }
+        self.last_raw = raw;
+        self.started = true;
+        self.absolute
+    }
 }
 
 /// One dictionary entry: a name and everything fixed by it.
@@ -164,11 +218,36 @@ struct DictionaryEntry {
 }
 
 impl TraceEncoder {
-    /// Creates an encoder with an empty dictionary and the counters at zero.
+    /// Creates an encoder for a sink whose readings are 64-bit monotonic
+    /// nanoseconds.
     pub const fn new() -> Self {
+        Self::with_clock(TickWidth::Monotonic64, TimeBase::Nanoseconds, 0)
+    }
+
+    /// Creates an encoder for a sink whose readings are a free-running 32-bit
+    /// core cycle counter (§5.8).
+    ///
+    /// The counter wraps every `2³² / core_frequency_hz` seconds — 59.65 s at
+    /// 72 MHz — and this encoder extends it, so a reading costs the sink one
+    /// volatile load with no critical section and no division. The frequency is
+    /// put on the stream header so the host can convert to wall time without
+    /// hard-coding it.
+    pub const fn with_cycle_counter(core_frequency_hz: u32) -> Self {
+        Self::with_clock(TickWidth::Wrapping32, TimeBase::Cycles, core_frequency_hz)
+    }
+
+    const fn with_clock(width: TickWidth, timebase: TimeBase, core_frequency_hz: u32) -> Self {
         Self {
             names: heapless::Vec::new(),
-            last_ticks: 0,
+            clock: TickClock {
+                width,
+                timebase,
+                core_frequency_hz,
+                last_raw: 0,
+                absolute: 0,
+                started: false,
+            },
+            last_emitted: 0,
             sequence: 0,
         }
     }
@@ -201,21 +280,20 @@ impl TraceEncoder {
     pub fn encode_trace_start(
         &mut self,
         timestamp_ticks: u64,
-        timebase: TimeBase,
-        core_frequency_hz: u32,
         source_mask: u32,
         out: &mut [u8],
     ) -> Result<usize, TracingEncodeError> {
+        let now = self.clock.extend(timestamp_ticks);
         let mut frame = RawTraceFrame::new(
             FrameKind::TraceStart,
-            Self::absolute(timestamp_ticks),
+            now,
             self.next_sequence(),
             UNKNOWN_NAME_ID,
         );
-        frame.timebase = timebase;
-        frame.core_frequency_hz = core_frequency_hz;
+        frame.timebase = self.clock.timebase;
+        frame.core_frequency_hz = self.clock.core_frequency_hz;
         frame.source_mask = source_mask;
-        self.last_ticks = timestamp_ticks;
+        self.last_emitted = now;
         encode_trace_frame(&frame, out)
     }
 
@@ -270,8 +348,9 @@ impl TraceEncoder {
         // Signed: a negative delta is an event that was recorded before the one
         // encoded ahead of it. Clamping it to zero while still moving the base
         // backwards would leave the host's clock permanently ahead (§19.10).
-        let delta = Self::absolute(timestamp_ns) - Self::absolute(self.last_ticks);
-        self.last_ticks = timestamp_ns;
+        let now = self.clock.extend(timestamp_ns);
+        let delta = now - self.last_emitted;
+        self.last_emitted = now;
         // Forwarded, not assigned: the number was taken when the event was
         // recorded, upstream of the producer queue, so a frame lost there still
         // leaves a gap on the wire (§5.7).
@@ -371,18 +450,14 @@ impl TraceEncoder {
     ) -> Option<Result<usize, TracingEncodeError>> {
         let entry = self.names.get(index)?.clone();
         let name_id = u32::try_from(index + 1).ok()?;
+        let now = self.clock.extend(timestamp_ticks);
         let sequence = self.next_sequence();
-        let mut frame = RawTraceFrame::new(
-            FrameKind::NameRegistered,
-            Self::absolute(timestamp_ticks),
-            sequence,
-            name_id,
-        );
+        let mut frame = RawTraceFrame::new(FrameKind::NameRegistered, now, sequence, name_id);
         frame.name = entry.name;
         frame.source_type = entry.source_type;
         frame.priority = entry.priority;
         frame.relative_deadline_ms = entry.relative_deadline_ms;
-        self.last_ticks = timestamp_ticks;
+        self.last_emitted = now;
         Some(encode_trace_frame(&frame, out))
     }
 
@@ -419,31 +494,17 @@ impl TraceEncoder {
             .map_err(|_| RegisterError::Full)?;
         let id = u32::try_from(self.names.len()).map_err(|_| RegisterError::Full)?;
 
+        let now = self.clock.extend(timestamp_ns);
         let sequence = self.next_sequence();
-        let mut frame = RawTraceFrame::new(
-            FrameKind::NameRegistered,
-            Self::absolute(timestamp_ns),
-            sequence,
-            id,
-        );
+        let mut frame = RawTraceFrame::new(FrameKind::NameRegistered, now, sequence, id);
         frame.name = name.clone();
         frame.source_type = source_type;
         frame.priority = priority;
         frame.relative_deadline_ms = relative_deadline_ms;
-        self.last_ticks = timestamp_ns;
+        self.last_emitted = now;
 
         let n = encode_trace_frame(&frame, out).map_err(RegisterError::Encode)?;
         Ok((id, n))
-    }
-
-    /// Device timestamps as the wire carries them.
-    ///
-    /// Saturating rather than wrapping: at nanosecond ticks `i64::MAX` is 292
-    /// years of uptime and at cycles it is further still, so this cannot be
-    /// reached in practice — but a wrap would desynchronise the host's clock for
-    /// good, where a saturation only stops it advancing.
-    fn absolute(ticks: u64) -> i64 {
-        i64::try_from(ticks).unwrap_or(i64::MAX)
     }
 
     /// Takes a number for a frame the encoder generates itself — the stream
@@ -1082,11 +1143,10 @@ mod tests {
 
     #[test]
     fn trace_start_carries_the_timebase_frequency_and_mask() {
-        let mut enc = TraceEncoder::new();
+        crate::reset_sequence();
+        let mut enc = TraceEncoder::with_cycle_counter(72_000_000);
         let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
-        let n = enc
-            .encode_trace_start(1_234, TimeBase::Cycles, 72_000_000, 0b10111, &mut buf)
-            .unwrap();
+        let n = enc.encode_trace_start(1_234, 0b10111, &mut buf).unwrap();
         let frames = decode_all(&buf[..n]);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].kind, FrameKind::TraceStart);
@@ -1098,11 +1158,84 @@ mod tests {
     }
 
     #[test]
+    fn a_nanosecond_encoder_declares_nanoseconds_and_no_frequency() {
+        let mut enc = TraceEncoder::new();
+        let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
+        let n = enc.encode_trace_start(1_234, 0x1F, &mut buf).unwrap();
+        let frame = decode_all(&buf[..n]).remove(0);
+        assert_eq!(frame.timebase, TimeBase::Nanoseconds);
+        assert_eq!(frame.core_frequency_hz, 0);
+    }
+
+    // ── A wrapping 32-bit cycle source (§5.8) ────────────────────────────────
+
+    #[test]
+    fn a_cycle_counter_wrap_is_an_ordinary_small_delta() {
+        // The counter rolls over every 59.65 s at 72 MHz. The encoder extends
+        // it, so the wire never sees the discontinuity.
+        let mut enc = TraceEncoder::with_cycle_counter(72_000_000);
+        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+        enc.encode(&span_end("a", u64::from(u32::MAX - 1_000)), &mut buf)
+            .unwrap();
+        // 2 001 cycles later — 1 001 to roll past u32::MAX, then 1 000 more.
+        let (bytes, _) = encode_one(&mut enc, &span_end("a", 1_000));
+        assert_eq!(decode_all(&bytes)[0].timestamp_ticks, 2_001);
+    }
+
+    #[test]
+    fn a_wrapped_absolute_timestamp_keeps_climbing() {
+        // A dictionary refresh after a wrap must not send the host's clock
+        // backwards: the extension, not the raw counter, goes on the wire.
+        let mut enc = TraceEncoder::with_cycle_counter(72_000_000);
+        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+        enc.encode(&span_end("a", u64::from(u32::MAX - 1_000)), &mut buf)
+            .unwrap();
+        let n = enc.encode_trace_start(1_000, 0x1F, &mut buf).unwrap();
+        let header = decode_all(&buf[..n]).remove(0);
+        assert!(
+            header.timestamp_ticks > i64::from(u32::MAX - 1_000),
+            "extended past the wrap, got {}",
+            header.timestamp_ticks
+        );
+    }
+
+    #[test]
+    fn a_cycle_source_still_carries_backwards_steps_exactly() {
+        // ISR preemption inverts a pair (§19.10). Against a wrapping source that
+        // is a small negative step, and must stay one rather than being read as
+        // a nearly-complete wrap forward.
+        let mut enc = TraceEncoder::with_cycle_counter(72_000_000);
+        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+        enc.encode(&span_end("a", 500_000), &mut buf).unwrap();
+        let (bytes, _) = encode_one(&mut enc, &span_end("a", 499_000));
+        assert_eq!(decode_all(&bytes)[0].timestamp_ticks, -1_000);
+    }
+
+    #[test]
+    fn cycle_deltas_reconstruct_the_elapsed_time_across_a_wrap() {
+        let mut enc = TraceEncoder::with_cycle_counter(72_000_000);
+        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+        let mut wire = Vec::new();
+        // 100 steps of 1 000 000 cycles, starting just before the rollover.
+        let mut raw = u32::MAX - 50_000_000;
+        for _ in 0..100 {
+            raw = raw.wrapping_add(1_000_000);
+            let (bytes, _) = encode_one(&mut enc, &span_end("a", u64::from(raw)));
+            wire.extend_from_slice(&bytes);
+        }
+        let elapsed: i64 = decode_all(&wire).iter().map(|f| f.timestamp_ticks).sum();
+        assert_eq!(
+            elapsed - i64::from(u32::MAX - 50_000_000),
+            100_000_000,
+            "100 steps of a million cycles, wrap included"
+        );
+    }
+
+    #[test]
     fn trace_start_sets_the_base_for_the_following_delta() {
         let mut enc = TraceEncoder::new();
         let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
-        enc.encode_trace_start(1_000, TimeBase::Nanoseconds, 0, 0x1F, &mut buf)
-            .unwrap();
+        enc.encode_trace_start(1_000, 0x1F, &mut buf).unwrap();
         let (bytes, _) = encode_one(&mut enc, &span_start("a", 1_500));
         let frames = decode_all(&bytes);
         assert_eq!(frames[0].timestamp_ticks, 1_500, "dictionary absolute");
@@ -1115,13 +1248,10 @@ mod tests {
         // frequency are free on the header.
         let mut enc = TraceEncoder::new();
         let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
-        let ns = enc
-            .encode_trace_start(0, TimeBase::Nanoseconds, 0, 0, &mut buf)
-            .unwrap();
+        let ns = enc.encode_trace_start(0, 0, &mut buf).unwrap();
         let mut enc = TraceEncoder::new();
-        let cycles = enc
-            .encode_trace_start(0, TimeBase::Cycles, 72_000_000, 0, &mut buf)
-            .unwrap();
+        let mut enc = TraceEncoder::with_cycle_counter(72_000_000);
+        let cycles = enc.encode_trace_start(0, 0, &mut buf).unwrap();
         assert!(cycles > ns);
     }
 
@@ -1386,9 +1516,7 @@ mod tests {
         let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
         let mut wire = Vec::new();
 
-        let n = enc
-            .encode_trace_start(1_000, TimeBase::Nanoseconds, 0, 0x1F, &mut buf)
-            .unwrap();
+        let n = enc.encode_trace_start(1_000, 0x1F, &mut buf).unwrap();
         wire.extend_from_slice(&buf[..n]);
 
         let events = [

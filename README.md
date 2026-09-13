@@ -36,7 +36,7 @@ impl TraceTransport for MyRttSink {
 }
 
 impl TraceSink for MyRttSink {
-    fn get_elapsed_nanoseconds(&self) -> u64 {
+    fn now_ticks(&self) -> u64 {
         0 // replace with your hardware timer
     }
 }
@@ -69,13 +69,17 @@ lets the host detect dropped frames. Emit the stream header once, then encode ev
 
 ```rust
 use execution_trace::{SourceType, TraceEncoder, TraceEvent};
-use execution_trace::encode::{MAX_TRACE_BURST_SIZE, TimeBase};
+use execution_trace::encode::MAX_TRACE_BURST_SIZE;
 
+// `new()` reads timestamps as 64-bit nanoseconds. For a sink returning a raw
+// core cycle counter use `TraceEncoder::with_cycle_counter(72_000_000)`: the
+// encoder then extends the 32-bit counter itself, so reading it costs the
+// caller one volatile load.
 let mut enc = TraceEncoder::new();
 let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
 
 // Once, at startup: declares the tick unit and the active source mask.
-if let Ok(n) = enc.encode_trace_start(0, TimeBase::Nanoseconds, 0, 0x1F, &mut buf) {
+if let Ok(n) = enc.encode_trace_start(0, 0x1F, &mut buf) {
     let _ = &buf[..n];
 }
 
