@@ -65,6 +65,10 @@ class SequenceTracker:
 
     Attributes:
         dropped: Running total of frames reported lost.
+        last_gap: ``(first_missing, count)`` for the hole the most recent
+            :meth:`observe` declared, or ``None`` if it declared none. Lets a
+            caller locate the hole in its own terms — the numbers either side of
+            it were received, so their timestamps bound it.
 
     Raises:
         ValueError: If *modulus* is not a positive power of two, which the
@@ -93,6 +97,7 @@ class SequenceTracker:
         # Numbers seen ahead of _expected, still within the window.
         self._pending: set[int] = set()
         self.dropped = 0
+        self.last_gap: tuple[int, int] | None = None
 
     @property
     def _last(self) -> int | None:
@@ -102,6 +107,8 @@ class SequenceTracker:
     def observe(self, sequence: int) -> bool:
         """Record a sequence number and detect resets or drops.
 
+        Sets :attr:`last_gap` to the hole this call declared, if any.
+
         Args:
             sequence: The sequence number from the received frame.
 
@@ -110,6 +117,7 @@ class SequenceTracker:
             backwards), ``False`` otherwise — including for ordinary loss, which
             is logged and counted rather than signalled.
         """
+        self.last_gap = None
         if self._expected is None:
             self._expected = (sequence + 1) & self._mask
             return False
@@ -147,6 +155,7 @@ class SequenceTracker:
         )
         if missing > 0:
             self.dropped += missing
+            self.last_gap = (expected, missing)
             logger.warning(
                 "%s drop detected: expected #%d, got #%d (%d dropped)",
                 self._label, expected, sequence, missing,

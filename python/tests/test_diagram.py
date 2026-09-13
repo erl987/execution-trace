@@ -179,3 +179,91 @@ class TestGenerateDiagram:
         out = tmp_path / "diagram.html"
         with pytest.raises(DiagramError):
             generate_diagram(csv_path=tmp_path / "nosuch.csv", output_path=out)
+
+
+# ---------------------------------------------------------------------------
+# Gap rendering (§5.9, AC 8)
+# ---------------------------------------------------------------------------
+
+HEADER = "name,type,start_us,end_us,priority,deadline_us,value,interrupted\n"
+
+
+def _gap_csv(tmp_path: Path) -> Path:
+    p = tmp_path / "gap.csv"
+    p.write_text(
+        HEADER
+        + "main_task,task,1000.0,1400.0,4,,,0\n"
+        + "main_task,task,2000.0,2000.0,4,,,1\n"      # interrupted by the gap
+        + "trace gap,gap,2000.0,3000.0,0,,7,0\n"
+        + "main_task,task,3000.0,3400.0,4,,,0\n"
+        + "gyro_isr,isr,3100.0,3140.0,8,,,0\n"
+    )
+    return p
+
+
+class TestGapRendering:
+    def test_a_gap_row_loads_without_being_treated_as_a_span(self, tmp_path):
+        pytest.importorskip("pandas")
+        from execution_trace.diagram import load_traces
+
+        df = load_traces(_gap_csv(tmp_path))
+        gaps = df[df["type"] == "gap"]
+        assert len(gaps) == 1
+        assert gaps.iloc[0]["value"] == 7
+
+    def test_a_zero_length_interrupted_span_is_accepted(self, tmp_path):
+        # Its end is a lower bound on when it finished, not a measurement, and a
+        # span cut at the frame that opened it is genuinely zero-length.
+        pytest.importorskip("pandas")
+        from execution_trace.diagram import load_traces
+
+        df = load_traces(_gap_csv(tmp_path))
+        cut = df[df["interrupted"]]
+        assert len(cut) == 1
+        assert cut.iloc[0]["start_us"] == cut.iloc[0]["end_us"]
+
+    def test_a_zero_length_span_that_is_not_interrupted_is_still_rejected(self, tmp_path):
+        pytest.importorskip("pandas")
+        from execution_trace.diagram import DiagramError, load_traces
+
+        p = tmp_path / "bad.csv"
+        p.write_text(HEADER + "main_task,task,1000.0,1000.0,4,,,0\n")
+        with pytest.raises(DiagramError, match="end_us must be"):
+            load_traces(p)
+
+    def test_an_interrupted_span_cannot_miss_its_deadline(self, tmp_path):
+        # Its end is unknown, so calling it an overrun would be an invention.
+        pytest.importorskip("pandas")
+        from execution_trace.diagram import load_traces
+
+        p = tmp_path / "dl.csv"
+        p.write_text(
+            HEADER
+            + "main_task,task,1000.0,1200.0,4,1100.0,,1\n"
+            + "main_task,task,2000.0,2200.0,4,2100.0,,0\n"
+        )
+        df = load_traces(p)
+        assert list(df["missed"]) == [False, True]
+
+    def test_gaps_keep_their_own_lane_slot(self, tmp_path):
+        pytest.importorskip("pandas")
+        from execution_trace.diagram import assign_lanes, load_traces
+
+        df, lanes = assign_lanes(load_traces(_gap_csv(tmp_path)))
+        assert set(lanes) == {"main_task", "gyro_isr"}
+        gaps = df[df["type"] == "gap"]
+        assert len(gaps) == 1, "the gap row survives lane assignment"
+        assert gaps.iloc[0]["lane"] == -1, "it spans every lane, so it owns none"
+
+    def test_the_diagram_renders_the_band_and_the_interrupted_span(self, tmp_path):
+        pytest.importorskip("bokeh")
+        pytest.importorskip("pandas")
+        from execution_trace.diagram import generate_diagram
+
+        out = tmp_path / "gap.html"
+        result = generate_diagram(_gap_csv(tmp_path), output_path=out)
+        assert result.output_path == out
+        html = out.read_text()
+        assert "Trace gap" in html, "the band needs a legend entry"
+        assert "Interrupted by gap" in html
+        assert "frames lost" in html, "the band is annotated with the count"

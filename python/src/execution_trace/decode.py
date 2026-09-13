@@ -26,9 +26,11 @@ Typical usage::
     )
 """
 
+import collections
 import csv
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Union
@@ -48,6 +50,10 @@ SEQUENCE_MODULUS: int = 16_384
 UNKNOWN_NAME_ID: int = 0
 
 UNKNOWN_NAME: str = "<unknown>"
+
+# How many recent frames to remember the arrival time of, for placing a hole the
+# reorder window only reveals later. Comfortably more than REORDER_WINDOW.
+SEEN_HISTORY: int = 512
 
 # How far a frame may arrive ahead of a missing one before that one is called
 # lost (EXEC-TRACE-002 §5.7, §19.12).
@@ -95,6 +101,32 @@ class TraceEvent:
     priority: int = 0
     deadline_us: Optional[float] = None
     value: Optional[int] = None
+    #: The span was cut short by a gap rather than closed by its own ``SPAN_END``
+    #: — its real end is unknown and at least ``end_us`` (§5.9).
+    interrupted: bool = False
+
+
+@dataclass
+class GapRecord:
+    """A stretch of the trace where frames were lost (EXEC-TRACE-002 §5.9).
+
+    Emitted as a row of its own so that missing data *looks* missing. Silent
+    truncation is what made a 2 % frame-loss rate read as a broken instrument
+    (§2.5).
+
+    Attributes:
+        name: Fixed label, so the row reads for itself in the CSV.
+        type: Always ``"gap"``.
+        start_us: Timestamp of the last frame received before the hole.
+        end_us: Timestamp of the first frame received after it.
+        frames_lost: How many frames the sequence says are missing.
+    """
+
+    start_us: float
+    end_us: float
+    frames_lost: int
+    name: str = "trace gap"
+    type: str = field(default="gap", init=False)
 
 
 @dataclass
@@ -175,6 +207,11 @@ class TraceStreamState:
         self._warned_ids: set[int] = set()
         #: Events dropped because their name id could not be resolved.
         self.unresolved_events: int = 0
+        # sequence -> absolute timestamp, for the most recent frames. A hole is
+        # reported up to REORDER_WINDOW frames after it happened, so locating it
+        # in time means looking up the numbers either side of it rather than
+        # using whatever frame happened to trigger the report.
+        self._seen_at: collections.OrderedDict[int, float] = collections.OrderedDict()
 
     def reset(self) -> None:
         """Discard all per-stream state after a device reset.
@@ -225,6 +262,27 @@ class TraceStreamState:
             self.clock_ticks += frame.timestamp_ticks
         return self.ticks_to_us(self.clock_ticks)
 
+    def note_seen(self, sequence: int, timestamp_us: float) -> None:
+        """Remember when a numbered frame arrived, for locating a later-found hole."""
+        self._seen_at[sequence] = timestamp_us
+        while len(self._seen_at) > SEEN_HISTORY:
+            self._seen_at.popitem(last=False)
+
+    def gap_bounds(self, first_missing: int, count: int) -> Optional[tuple[float, float]]:
+        """Timestamps bracketing a hole, from the frames either side of it.
+
+        Returns ``None`` when neither neighbour is still in history, which leaves
+        the gap unplaceable — it is then reported in the log only.
+        """
+        before = self._seen_at.get((first_missing - 1) % SEQUENCE_MODULUS)
+        after = self._seen_at.get((first_missing + count) % SEQUENCE_MODULUS)
+        if before is None and after is None:
+            return None
+        start = before if before is not None else after
+        end = after if after is not None else before
+        assert start is not None and end is not None  # noqa: S101 - narrowing for mypy
+        return (start, max(end, start))
+
     def resolve(self, name_id: int) -> Optional[NameEntry]:
         """Look up a dictionary id.
 
@@ -268,6 +326,11 @@ class TraceEventBuffer:
         self._pending: dict[str, tuple[float, NameEntry]] = {}
         self._records: list[TraceEvent] = []
         self._markers: list[MarkerRecord] = []
+        self._gaps: list[GapRecord] = []
+        # Names whose span a gap cut short. The next SPAN_END for each is the
+        # other half of a pair whose START is already closed, so it is dropped
+        # rather than paired with a later, unrelated START (§5.9).
+        self._orphaned_ends: set[str] = set()
 
     def push(
         self,
@@ -288,6 +351,11 @@ class TraceEventBuffer:
                 logger.warning("Tracing: duplicate START for '%s' — discarding previous", name)
             self._pending[name] = (timestamp_us, entry)
         elif frame.event_type == tracing_pb2.SPAN_END:
+            if name in self._orphaned_ends:
+                # Its START was closed by interrupt_open_spans; pairing this with
+                # whatever opens next would invent a span that never ran.
+                self._orphaned_ends.discard(name)
+                return
             if name not in self._pending:
                 logger.warning("Tracing: END for '%s' with no matching START — discarding", name)
                 return
@@ -313,6 +381,55 @@ class TraceEventBuffer:
             self._markers.append(
                 MarkerRecord(name=name, timestamp_us=timestamp_us, value=value)
             )
+
+    def interrupt_open_spans(self, at_us: float, frames_lost: int, resumed_us: float) -> None:
+        """Close every span open at a gap, and record the gap itself.
+
+        A span whose ``SPAN_END`` was lost would otherwise stay open until the
+        next unrelated end for that name, producing one enormous bar across the
+        hole and well past it — which is the visual damage §2.5 describes. Each
+        open span is instead cut at the last frame before the gap and marked
+        interrupted, so the diagram shows a span of unknown length rather than a
+        wrong one.
+
+        Args:
+            at_us: Timestamp of the last frame received before the hole.
+            frames_lost: How many frames the sequence says are missing.
+            resumed_us: Timestamp of the first frame received after it.
+        """
+        self._gaps.append(
+            GapRecord(start_us=at_us, end_us=max(resumed_us, at_us), frames_lost=frames_lost)
+        )
+        # Only spans that were already running when the hole happened. The
+        # reorder window means this is discovered up to 64 frames later, by which
+        # time other spans have opened — and one that started after the hole
+        # cannot have been affected by it.
+        caught = [
+            (name, value) for name, value in self._pending.items() if value[0] <= at_us
+        ]
+        for name, (start_us, entry) in caught:
+            self._records.append(
+                TraceEvent(
+                    name=name,
+                    type="isr" if entry.source_type == tracing_pb2.ISR else "task",
+                    start_us=start_us,
+                    end_us=at_us,
+                    priority=entry.priority,
+                    deadline_us=(
+                        start_us + entry.relative_deadline_ms * 1_000.0
+                        if entry.relative_deadline_ms is not None
+                        else None
+                    ),
+                    interrupted=True,
+                )
+            )
+            self._orphaned_ends.add(name)
+            del self._pending[name]
+
+    @property
+    def gaps(self) -> list[GapRecord]:
+        """Gap records in arrival order."""
+        return list(self._gaps)
 
     def flush_pending(self) -> None:
         """Warn about any unmatched ``SPAN_START`` events and clear pending state.
@@ -398,6 +515,16 @@ def decode_tracing_stream(
             # would misalign the rest of the stream permanently.
 
         timestamp_us = state.advance(frame)
+        state.note_seen(frame.sequence, timestamp_us)
+
+        # A hole the tracker has just become certain of. Close whatever was open
+        # across it, so a span whose end was lost does not run on for ever, and
+        # record the gap as a row of its own (§5.9).
+        if state.tracker.last_gap is not None:
+            first_missing, lost = state.tracker.last_gap
+            bounds = state.gap_bounds(first_missing, lost)
+            if bounds is not None:
+                event_buffer.interrupt_open_spans(bounds[0], lost, bounds[1])
 
         if frame.event_type == tracing_pb2.TRACE_START:
             state.timebase = frame.timebase
@@ -434,7 +561,7 @@ def decode_tracing_stream(
 
 
 def write_tracing_csv(
-    records: list[Union[TraceEvent, MarkerRecord]],
+    records: Sequence[Union[TraceEvent, MarkerRecord, GapRecord]],
     output_dir: str = "data",
 ) -> Optional[str]:
     """Write span and marker records to a timestamped CSV file.
@@ -459,7 +586,10 @@ def write_tracing_csv(
     +---------------+------------------------------------------+
     | ``deadline_us``| absolute deadline in µs, or empty       |
     +---------------+------------------------------------------+
-    | ``value``     | optional u32 payload, or empty           |
+    | ``value``     | optional u32 payload; frames lost on a   |
+    |               | ``gap`` row, or empty                    |
+    +---------------+------------------------------------------+
+    | ``interrupted``| ``1`` when a gap cut the span short     |
     +---------------+------------------------------------------+
 
     Args:
@@ -488,19 +618,29 @@ def write_tracing_csv(
 
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["name", "type", "start_us", "end_us", "priority", "deadline_us", "value"])
+        writer.writerow([
+            "name", "type", "start_us", "end_us", "priority", "deadline_us", "value",
+            "interrupted",
+        ])
         for r in records:
             if isinstance(r, MarkerRecord):
                 writer.writerow([
                     r.name, "marker",
                     r.timestamp_us, r.timestamp_us,
-                    0, "", _optional(r.value),
+                    0, "", _optional(r.value), 0,
+                ])
+            elif isinstance(r, GapRecord):
+                writer.writerow([
+                    r.name, "gap",
+                    r.start_us, r.end_us,
+                    0, "", r.frames_lost, 0,
                 ])
             else:
                 writer.writerow([
                     r.name, r.type,
                     r.start_us, r.end_us,
                     r.priority, _optional(r.deadline_us), _optional(r.value),
+                    int(r.interrupted),
                 ])
 
     # Atomically replace the symlink so trace_latest.csv always points to newest.

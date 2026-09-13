@@ -4,7 +4,7 @@ Public API re-exported for convenience::
 
     from execution_trace import (
         SequenceTracker, iter_frames, encode_varint, decode_varint,
-        TraceEvent, MarkerRecord, NameEntry, TraceEventBuffer, TraceStreamState,
+        TraceEvent, MarkerRecord, GapRecord, NameEntry, TraceEventBuffer, TraceStreamState,
         decode_tracing_stream, write_tracing_csv,
     )
 
@@ -17,6 +17,7 @@ Import it directly when needed::
 
 from execution_trace.decode import (
     SEQUENCE_MODULUS,
+    GapRecord,
     MarkerRecord,
     NameEntry,
     TraceEvent,
@@ -39,6 +40,7 @@ __all__ = [
     "decode_varint",
     "TraceEvent",
     "MarkerRecord",
+    "GapRecord",
     "NameEntry",
     "TraceEventBuffer",
     "TraceStreamState",

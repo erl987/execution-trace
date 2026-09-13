@@ -194,9 +194,23 @@ def load_traces(
     if len(df) == 0:
         die("tracing CSV contains no data rows")
 
-    # Markers have start_us == end_us == timestamp_us; only validate spans.
+    if "interrupted" in df.columns:
+        df["interrupted"] = (
+            pd.to_numeric(df["interrupted"], errors="coerce").fillna(0).astype(bool)
+        )
+    else:
+        df["interrupted"] = False
+
+    # Markers have start_us == end_us == timestamp_us, and a gap row is a band
+    # rather than an interval that ran; only validate spans.
     spans = df[df["type"].isin(["task", "isr"])]
-    bad = spans[spans["end_us"] <= spans["start_us"]]
+    # An interrupted span is cut at the last frame before a gap, which can be the
+    # very frame that opened it — so it may be zero-length. Its end is a lower
+    # bound on when it finished, not a measurement, and zero is a true one.
+    bad = spans[
+        (spans["end_us"] < spans["start_us"])
+        | ((spans["end_us"] == spans["start_us"]) & ~spans["interrupted"])
+    ]
     if not bad.empty:
         csv_row = bad.index[0] + 2
         die(f"row {csv_row}: end_us must be > start_us")
@@ -210,6 +224,9 @@ def load_traces(
     df["missed"] = (
         df["effective_deadline_us"].notna()
         & (df["end_us"] > df["effective_deadline_us"])
+        # An interrupted span's end is unknown and only a lower bound, so it
+        # cannot be said to have overrun (§5.9).
+        & ~df["interrupted"]
     )
     return df.reset_index(drop=True)
 
@@ -225,7 +242,8 @@ def assign_lanes(df: "pd.DataFrame") -> "tuple[pd.DataFrame, list[str]]":
 
     Marker rows are assigned to the lane of the highest-priority span that
     contains the marker's timestamp. Uncontained markers receive lane ``-1``
-    (rendered below all spans).
+    (rendered below all spans). Gap rows span every lane and are carried through
+    with lane ``-1`` as well.
 
     Args:
         df: Validated DataFrame from :func:`load_traces` (spans and markers).
@@ -237,6 +255,7 @@ def assign_lanes(df: "pd.DataFrame") -> "tuple[pd.DataFrame, list[str]]":
     """
     spans = df[df["type"].isin(["task", "isr"])].copy()
     markers = df[df["type"] == "marker"].copy()
+    gaps = df[df["type"] == "gap"].copy()
 
     name_type = spans.groupby("name", sort=False)["type"].first()
     name_priority = spans.groupby("name", sort=False)["priority"].first()
@@ -267,7 +286,10 @@ def assign_lanes(df: "pd.DataFrame") -> "tuple[pd.DataFrame, list[str]]":
         markers = markers.copy()
         markers["lane"] = markers["start_us"].apply(_infer_lane)
 
-    df = pd.concat([spans, markers], ignore_index=True) if not markers.empty else spans
+    if not gaps.empty:
+        gaps["lane"] = -1
+    parts = [part for part in (spans, markers, gaps) if not part.empty]
+    df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
     return df, top_to_bottom
 
 
@@ -309,10 +331,19 @@ def _fmt_ms(v: float) -> str:
     return "—" if pd.isna(v) else f"{v / 1_000:,.3f} ms"
 
 
-def _bar_source(sub: "pd.DataFrame", colors: dict[str, str]) -> ColumnDataSource:
+def _bar_source(
+    sub: "pd.DataFrame", colors: dict[str, str], min_width: float = 0.0
+) -> ColumnDataSource:
+    # An interrupted span can be zero-length; without a floor it would vanish,
+    # which is the opposite of what §5.9 is for.
+    right = sub["end_us"] if min_width <= 0 else (
+        sub[["end_us", "start_us"]].max(axis=1).combine(
+            sub["start_us"] + min_width, max
+        )
+    )
     return ColumnDataSource({
         "left": sub["start_us"].tolist(),
-        "right": sub["end_us"].tolist(),
+        "right": right.tolist(),
         "top": (sub["lane"] + _HALF_H).tolist(),
         "bottom": (sub["lane"] - _HALF_H).tolist(),
         "name": sub["name"].tolist(),
@@ -346,6 +377,7 @@ def build_figure(
     """
     spans = df[df["type"].isin(["task", "isr"])]
     markers = df[df["type"] == "marker"]
+    gaps = df[df["type"] == "gap"]
 
     n = len(lane_names)
     x_lo = float(spans["start_us"].min())
@@ -373,6 +405,42 @@ def build_figure(
             fill_alpha=0.55, line_color=None,
         )
 
+    # Gap bands go down before the bars so the spans either side stay legible on
+    # top of them. A trace that is missing data has to look like one (§5.9).
+    if not gaps.empty:
+        # A gap of zero width would be invisible; give it a hairline so the
+        # annotation still has something to sit on.
+        min_w = max((x_hi - x_lo) * 0.0008, 1.0)
+        widths = (gaps["end_us"] - gaps["start_us"]).clip(lower=min_w)
+        gap_src = ColumnDataSource({
+            "left": gaps["start_us"].tolist(),
+            "right": (gaps["start_us"] + widths).tolist(),
+            "bottom": [-0.6] * len(gaps),
+            "top": [n - 0.4] * len(gaps),
+            "frames_lost": [
+                int(v) if pd.notna(v) else 0 for v in gaps["value"]
+            ],
+            "start_us": gaps["start_us"].tolist(),
+        })
+        gap_renderer = p.quad(
+            left="left", right="right", bottom="bottom", top="top",
+            source=gap_src,
+            fill_color="#b71c1c", fill_alpha=0.13,
+            hatch_pattern="/", hatch_color="#b71c1c", hatch_alpha=0.45, hatch_scale=12,
+            line_color="#b71c1c", line_width=1.0, line_alpha=0.55,
+            legend_label="Trace gap",
+        )
+        p.add_tools(HoverTool(
+            renderers=[gap_renderer],
+            tooltips=[("trace gap", "@frames_lost frames lost"), ("at", "@start_us{0,0.0} µs")],
+        ))
+        labels = LabelSet(
+            x="start_us", y=n - 0.45, text="frames_lost",
+            source=gap_src, text_color="#b71c1c", text_font_size="9pt",
+            x_offset=3, y_offset=-12,
+        )
+        p.add_layout(labels)
+
     span_renderers = []
     marker_renderers = []
 
@@ -382,11 +450,12 @@ def build_figure(
         line_color: str,
         line_width: float,
         legend_label: str,
+        min_width: float = 0.0,
     ) -> None:
         sub = spans[mask]
         if sub.empty:
             return
-        src = _bar_source(sub, colors)
+        src = _bar_source(sub, colors, min_width=min_width)
         hatch_kw = (
             dict(hatch_pattern=hatch, hatch_color="white", hatch_alpha=0.40, hatch_scale=9)
             if hatch is not None else {}
@@ -400,14 +469,21 @@ def build_figure(
         )
         span_renderers.append(r)
 
-    _add_bars((spans["type"] == "task") & ~spans["missed"],
+    cut = spans["interrupted"]
+    _add_bars((spans["type"] == "task") & ~spans["missed"] & ~cut,
               None, "#555555", _NORMAL_LW, "Task")
-    _add_bars((spans["type"] == "isr") & ~spans["missed"],
+    _add_bars((spans["type"] == "isr") & ~spans["missed"] & ~cut,
               "/", "#555555", _NORMAL_LW, "ISR")
-    _add_bars((spans["type"] == "task") & spans["missed"],
+    _add_bars((spans["type"] == "task") & spans["missed"] & ~cut,
               None, "crimson", _MISSED_LW, "Missed deadline")
-    _add_bars((spans["type"] == "isr") & spans["missed"],
+    _add_bars((spans["type"] == "isr") & spans["missed"] & ~cut,
               "/", "crimson", _MISSED_LW, "ISR — missed deadline")
+    # Cut short by a gap: the end is a lower bound, not a measurement, so it is
+    # drawn open-ended rather than as a span of that length.
+    _add_bars(
+        cut, "x", "#b71c1c", _MISSED_LW, "Interrupted by gap",
+        min_width=max((x_hi - x_lo) * 0.0008, 1.0),
+    )
 
     dl = spans[spans["effective_deadline_us"].notna()].copy()
     if not dl.empty:

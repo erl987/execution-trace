@@ -10,6 +10,7 @@ from conftest import StreamBuilder, make_frame
 
 from execution_trace._proto import tracing_pb2
 from execution_trace.decode import (
+    GapRecord,
     REORDER_WINDOW,
     RESET_BACKWARD_MARGIN_US,
     SEQUENCE_MODULUS,
@@ -642,3 +643,100 @@ class TestWriteTracingCsv:
         assert float(row["end_us"]) == pytest.approx(2000.0)
         assert row["priority"] == "4"
         assert float(row["deadline_us"]) == pytest.approx(5000.0)
+
+
+# ---------------------------------------------------------------------------
+# Gap handling (§5.9)
+# ---------------------------------------------------------------------------
+
+class TestGapHandling:
+    """AC 8: a stream with an injected gap renders every span open at the gap as
+    interrupted, and the gap as an annotated band."""
+
+    def _stream_with_lost_span_end(self) -> tuple[TraceStreamState, TraceEventBuffer]:
+        b = StreamBuilder().start(timestamp_ticks=0)
+        t = 1_000_000
+        for _ in range(5):
+            b.span("main_task", t, t + 400_000, priority=4)
+            t += 1_000_000
+        # A cycle whose SPAN_END never reached the transport: its number is
+        # burned, which is what makes the loss visible at all (§5.7).
+        b.event(tracing_pb2.SPAN_START, "main_task", t, priority=4)
+        b._next_sequence()
+        t += 1_000_000
+        # Enough traffic afterwards to carry past the reorder window.
+        for _ in range(REORDER_WINDOW + 4):
+            b.span("gyro_isr", t, t + 40_000, source_type=tracing_pb2.ISR, priority=8)
+            t += 1_000_000
+        state, event_buffer = TraceStreamState("gap"), TraceEventBuffer()
+        decode_tracing_stream(b.bytes(), state, event_buffer)
+        return state, event_buffer
+
+    def test_a_gap_is_recorded_with_its_frame_count(self):
+        state, eb = self._stream_with_lost_span_end()
+        assert state.tracker.dropped == 1
+        assert len(eb.gaps) == 1
+        gap = eb.gaps[0]
+        assert isinstance(gap, GapRecord)
+        assert gap.frames_lost == 1
+        assert gap.type == "gap"
+        assert gap.end_us >= gap.start_us
+
+    def test_the_gap_is_placed_between_the_frames_either_side_of_it(self):
+        # Not where the reorder window happened to notice: that is up to 64
+        # frames later, which on this trace would be tens of milliseconds off.
+        state, eb = self._stream_with_lost_span_end()
+        gap = eb.gaps[0]
+        assert gap.start_us == pytest.approx(6_000.0), "the lost END's own SPAN_START"
+        assert gap.end_us == pytest.approx(7_000.0), "the next frame that did arrive"
+
+    def test_the_span_open_at_the_gap_is_interrupted(self):
+        state, eb = self._stream_with_lost_span_end()
+        cut = [r for r in eb.records if r.interrupted]
+        assert len(cut) == 1
+        assert cut[0].name == "main_task"
+        assert cut[0].start_us == pytest.approx(6_000.0)
+        assert cut[0].end_us == pytest.approx(6_000.0), "cut at the last good frame"
+
+    def test_an_uninterrupted_span_is_untouched(self):
+        state, eb = self._stream_with_lost_span_end()
+        whole = [r for r in eb.records if not r.interrupted and r.name == "main_task"]
+        assert len(whole) == 5
+        assert all(r.end_us - r.start_us == pytest.approx(400.0) for r in whole)
+
+    def test_the_first_end_after_the_gap_is_discarded_not_paired(self):
+        # Otherwise it closes whatever START opens next and invents a span that
+        # never ran — the damage §5.9 exists to prevent.
+        b = StreamBuilder().start(timestamp_ticks=0)
+        b.event(tracing_pb2.SPAN_START, "main_task", 1_000_000, priority=4)
+        b._next_sequence()  # a frame lost at the queue
+        for i in range(REORDER_WINDOW + 4):
+            b.span("gyro_isr", 2_000_000 + i * 1_000_000,
+                   2_040_000 + i * 1_000_000,
+                   source_type=tracing_pb2.ISR, priority=8)
+        # main_task's END finally arrives, long after its START was closed.
+        b.event(tracing_pb2.SPAN_END, "main_task", 90_000_000)
+        state, eb = TraceStreamState("gap"), TraceEventBuffer()
+        decode_tracing_stream(b.bytes(), state, eb)
+
+        main = [r for r in eb.records if r.name == "main_task"]
+        assert len(main) == 1, "the orphaned END must not produce a second span"
+        assert main[0].interrupted
+        assert main[0].end_us == pytest.approx(1_000.0)
+
+    def test_a_clean_stream_records_no_gap(self, builder):
+        builder.span("t", 0, 1_000)
+        builder.span("t", 2_000, 3_000)
+        _, eb = _decode(builder.bytes())
+        assert eb.gaps == []
+        assert not any(r.interrupted for r in eb.records)
+
+    def test_gap_rows_reach_the_csv(self, tmp_path):
+        _, eb = self._stream_with_lost_span_end()
+        path = write_tracing_csv(eb.records + eb.markers + eb.gaps, output_dir=str(tmp_path))
+        assert path is not None
+        rows = list(csv.DictReader(open(path)))
+        gaps = [r for r in rows if r["type"] == "gap"]
+        assert len(gaps) == 1
+        assert gaps[0]["value"] == "1", "frames lost travels in the value column"
+        assert any(r["interrupted"] == "1" for r in rows)

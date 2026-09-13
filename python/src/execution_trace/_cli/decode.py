@@ -13,9 +13,12 @@ Usage::
 import argparse
 import sys
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, Union
 
 from execution_trace.decode import (
+    GapRecord,
+    MarkerRecord,
+    TraceEvent,
     TraceEventBuffer,
     TraceStreamState,
     decode_tracing_stream,
@@ -65,7 +68,13 @@ def main() -> None:
     decode_tracing_stream(buf, state, event_buffer)
     event_buffer.flush_pending()
 
-    records = event_buffer.records + event_buffer.markers
+    # Gap rows carry the frames the link lost; without them the CSV shows an
+    # unexplained hole and interrupted spans with no reason beside them.
+    records: list[Union[TraceEvent, MarkerRecord, GapRecord]] = [
+        *event_buffer.records,
+        *event_buffer.markers,
+        *event_buffer.gaps,
+    ]
     csv_path = write_tracing_csv(records, output_dir=output_dir)
 
     if csv_path is None:
