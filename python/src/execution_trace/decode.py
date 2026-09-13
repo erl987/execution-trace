@@ -49,6 +49,18 @@ UNKNOWN_NAME_ID: int = 0
 
 UNKNOWN_NAME: str = "<unknown>"
 
+# How far a frame may arrive ahead of a missing one before that one is called
+# lost (EXEC-TRACE-002 §5.7, §19.12).
+#
+# Frames are numbered by their producer, before the queue the transport drains,
+# so an ISR preempting a task between those two points takes a later number and
+# reaches the wire first. The transport's own frames — the header and the
+# dictionary — are numbered when written and can overtake events already queued,
+# which bounds the reordering by the depth of that queue rather than by the
+# preemption window. 64 covers the 48-slot channel with margin; the cost of the
+# margin is only that a genuine loss is reported this many frames later.
+REORDER_WINDOW: int = 64
+
 # How far the device clock must appear to jump *backwards* on a TRACE_START
 # before it is read as a reboot rather than as ordering jitter.
 #
@@ -148,7 +160,9 @@ class TraceStreamState:
 
     def __init__(self, label: str = "Trace event") -> None:
         self.label = label
-        self.tracker = SequenceTracker(label, modulus=SEQUENCE_MODULUS)
+        self.tracker = SequenceTracker(
+            label, modulus=SEQUENCE_MODULUS, reorder_window=REORDER_WINDOW
+        )
         self.names: dict[int, NameEntry] = {}
         #: Reconstructed device time, in ticks. Signed, because a frame's delta
         #: can be negative — see the `timestamp_ticks` field comment in the proto.
@@ -168,7 +182,9 @@ class TraceStreamState:
         The dictionary must go with it: the device reassigns ids from one on
         reboot, so a stale entry would resolve a new id to the wrong name.
         """
-        self.tracker = SequenceTracker(self.label, modulus=SEQUENCE_MODULUS)
+        self.tracker = SequenceTracker(
+            self.label, modulus=SEQUENCE_MODULUS, reorder_window=REORDER_WINDOW
+        )
         self.names.clear()
         self._warned_ids.clear()
         self.unresolved_events = 0

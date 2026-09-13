@@ -173,7 +173,11 @@ impl TraceEncoder {
         }
     }
 
-    /// Returns the sequence number of the *next* frame.
+    /// Returns the sequence number this encoder last took for a frame of its own
+    /// (the stream header or a dictionary entry).
+    ///
+    /// Recorded events are numbered by the producer, not here, so this does not
+    /// track them; see [`next_sequence`](crate::next_sequence).
     pub fn sequence(&self) -> u32 {
         self.sequence
     }
@@ -268,7 +272,10 @@ impl TraceEncoder {
         // backwards would leave the host's clock permanently ahead (§19.10).
         let delta = Self::absolute(timestamp_ns) - Self::absolute(self.last_ticks);
         self.last_ticks = timestamp_ns;
-        let sequence = self.next_sequence();
+        // Forwarded, not assigned: the number was taken when the event was
+        // recorded, upstream of the producer queue, so a frame lost there still
+        // leaves a gap on the wire (§5.7).
+        let sequence = event.sequence();
 
         let mut frame = match event {
             TraceEvent::SpanStart { .. } => {
@@ -439,10 +446,16 @@ impl TraceEncoder {
         i64::try_from(ticks).unwrap_or(i64::MAX)
     }
 
+    /// Takes a number for a frame the encoder generates itself — the stream
+    /// header and the dictionary entries, which were never "recorded" and so
+    /// have no producer-side number of their own.
+    ///
+    /// Drawn from the same global counter as recorded events: one sequence space
+    /// is what makes a gap mean anything.
     fn next_sequence(&mut self) -> u32 {
-        let current = self.sequence;
-        self.sequence = (self.sequence + 1) % SEQUENCE_MODULUS;
-        current
+        let taken = crate::next_sequence();
+        self.sequence = taken;
+        taken
     }
 }
 
@@ -646,12 +659,14 @@ mod tests {
         n
     }
 
+    /// Builds an event the way the recording layer does, including taking its
+    /// producer-side sequence number (§5.7).
     fn span_start(n: &str, ts: u64) -> TraceEvent {
         TraceEvent::SpanStart {
             timestamp_ns: ts,
             name: name(n),
             source_type: SourceType::Task,
-            sequence: 0,
+            sequence: crate::next_sequence(),
             priority: 2,
             relative_deadline_ms: None,
         }
@@ -662,7 +677,7 @@ mod tests {
             timestamp_ns: ts,
             name: name(n),
             source_type: SourceType::Isr,
-            sequence: 0,
+            sequence: crate::next_sequence(),
             priority: 8,
             relative_deadline_ms: Some(0.5),
         }
@@ -672,7 +687,7 @@ mod tests {
         TraceEvent::SpanEnd {
             timestamp_ns: ts,
             name: name(n),
-            sequence: 0,
+            sequence: crate::next_sequence(),
         }
     }
 
@@ -680,7 +695,7 @@ mod tests {
         TraceEvent::Marker {
             timestamp_ns: ts,
             name: name(n),
-            sequence: 0,
+            sequence: crate::next_sequence(),
             marker_value: value,
         }
     }
@@ -964,37 +979,66 @@ mod tests {
 
     // ── Sequencing (§18.1) ────────────────────────────────────────────────────
 
-    #[test]
-    fn sequence_starts_at_zero_and_advances_per_frame() {
-        let mut enc = TraceEncoder::new();
-        assert_eq!(enc.sequence(), 0);
-        let (bytes, _) = encode_one(&mut enc, &span_start("a", 0));
-        let frames = decode_all(&bytes);
-        assert_eq!(frames[0].sequence, 0, "dictionary frame is sequenced too");
-        assert_eq!(frames[1].sequence, 1);
-        assert_eq!(enc.sequence(), 2);
+    /// Serialises the tests that assert on absolute sequence numbers. The
+    /// counter is process-global by design (§5.7), so the test harness running
+    /// them on separate threads would otherwise make them depend on each other.
+    static SEQUENCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_fresh_sequence<T>(body: impl FnOnce() -> T) -> T {
+        let guard = SEQUENCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::reset_sequence();
+        let out = body();
+        drop(guard);
+        out
     }
 
     #[test]
-    fn sequence_wraps_at_the_modulus_not_at_u32_max() {
+    fn the_encoder_forwards_the_number_the_event_was_recorded_with() {
+        // The whole point of §5.7: the transport does not number events, so an
+        // event lost before it reaches the transport still burned a number.
         let mut enc = warmed(&["a"]);
-        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
-        while enc.sequence() != SEQUENCE_MODULUS - 1 {
-            enc.encode(&span_end("a", 0), &mut buf).unwrap();
+        let mut event = span_end("a", 0);
+        event.set_sequence(4_321);
+        let (bytes, _) = encode_one(&mut enc, &event);
+        assert_eq!(decode_all(&bytes)[0].sequence, 4_321);
+    }
+
+    #[test]
+    fn a_gap_in_recorded_numbers_survives_to_the_wire() {
+        // A frame dropped at the producer queue: the encoder never sees it, and
+        // the numbers either side of it must still show the hole (AC 7).
+        let mut enc = warmed(&["a"]);
+        let mut wire = Vec::new();
+        for seq in [10u32, 11, /* 12 dropped at the queue */ 13] {
+            let mut event = span_end("a", 0);
+            event.set_sequence(seq);
+            let (bytes, _) = encode_one(&mut enc, &event);
+            wire.extend_from_slice(&bytes);
         }
-        let (bytes, _) = encode_one(&mut enc, &span_end("a", 0));
-        assert_eq!(decode_all(&bytes)[0].sequence, SEQUENCE_MODULUS - 1);
-        assert_eq!(enc.sequence(), 0, "wraps to zero, not to 16384");
+        let seen: Vec<u32> = decode_all(&wire).iter().map(|f| f.sequence).collect();
+        assert_eq!(seen, vec![10, 11, 13]);
     }
 
     #[test]
-    fn sequence_never_exceeds_the_modulus() {
-        let mut enc = warmed(&["a"]);
-        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+    fn recorded_numbers_are_consecutive_and_wrap_at_the_modulus() {
+        with_fresh_sequence(|| {
+            let drawn: Vec<u32> = (0..SEQUENCE_MODULUS + 3)
+                .map(|_| crate::next_sequence())
+                .collect();
+            assert_eq!(drawn[0], 0);
+            assert_eq!(drawn[SEQUENCE_MODULUS as usize - 1], SEQUENCE_MODULUS - 1);
+            assert_eq!(
+                drawn[SEQUENCE_MODULUS as usize], 0,
+                "wraps to zero, not to 16384"
+            );
+            assert_eq!(drawn[SEQUENCE_MODULUS as usize + 1], 1);
+        });
+    }
+
+    #[test]
+    fn recorded_numbers_never_exceed_the_modulus() {
         for _ in 0..(SEQUENCE_MODULUS * 2) {
-            let n = enc.encode(&span_end("a", 0), &mut buf).unwrap();
-            let frame = decode_all(&buf[..n.len]).remove(0);
-            assert!(frame.sequence < SEQUENCE_MODULUS);
+            assert!(crate::next_sequence() < SEQUENCE_MODULUS);
         }
     }
 
@@ -1132,6 +1176,9 @@ mod tests {
 
     /// Steady-state frame size for each event class at a representative delta.
     fn steady_state_sizes(delta: u64) -> [usize; 4] {
+        // From a known counter: the sequence is a varint, so its magnitude is
+        // part of the frame size being measured.
+        crate::reset_sequence();
         let mut enc = warmed(&["main_task", "ukf_predict"]);
         let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
         let mut t = 1_000_000_000u64;
@@ -1141,7 +1188,6 @@ mod tests {
             marker("ukf_predict", 0, Some(42)),
             marker("ukf_predict", 0, None),
         ];
-        // Push the sequence into its two-varint-byte range, the common case.
         for _ in 0..200 {
             t += delta;
             enc.encode(&span_end("main_task", t), &mut buf).unwrap();
@@ -1155,6 +1201,10 @@ mod tests {
                 | TraceEvent::SpanEnd { timestamp_ns, .. }
                 | TraceEvent::Marker { timestamp_ns, .. } => *timestamp_ns = t,
             }
+            // A mid-range sequence, which is what a running device carries: the
+            // number is a varint, and only the 128 values below the first
+            // boundary — 0.8 % of the 16 384-wide space — cost a single byte.
+            ev.set_sequence(8_000);
             sizes[i] = enc.encode(&ev, &mut buf).unwrap().len;
         }
         sizes
@@ -1216,6 +1266,7 @@ mod tests {
 
     #[test]
     fn span_start_wire_format_snapshot() {
+        crate::reset_sequence();
         let mut enc = TraceEncoder::new();
         let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
         let n = enc
@@ -1356,12 +1407,11 @@ mod tests {
         let mut dictionary: std::collections::HashMap<u32, std::string::String> =
             std::collections::HashMap::new();
         let mut clock = 0i64;
-        let mut expect_sequence = 0u32;
+        let mut seen_sequences: Vec<u32> = Vec::new();
         let mut resolved: Vec<(std::string::String, i64, FrameKind)> = Vec::new();
 
         for frame in decode_all(&wire) {
-            assert_eq!(frame.sequence, expect_sequence, "no gaps in a clean stream");
-            expect_sequence = (expect_sequence + 1) % SEQUENCE_MODULUS;
+            seen_sequences.push(frame.sequence);
             clock = match frame.kind {
                 FrameKind::NameRegistered | FrameKind::TraceStart => frame.timestamp_ticks,
                 _ => clock + frame.timestamp_ticks,
@@ -1386,5 +1436,18 @@ mod tests {
             ]
         );
         assert_eq!(dictionary.len(), 2, "each name registered exactly once");
+
+        // Every number in the range is present exactly once — a clean stream has
+        // no gaps. They are *not* in order on the wire: a dictionary frame is
+        // written ahead of the event that triggered it but numbered after it,
+        // because the event was numbered by its producer (§5.7, §19.12).
+        let mut sorted = seen_sequences.clone();
+        sorted.sort_unstable();
+        let expected: Vec<u32> = (0..u32::try_from(seen_sequences.len()).unwrap()).collect();
+        assert_eq!(sorted, expected, "no gaps in a clean stream");
+        assert_ne!(
+            seen_sequences, expected,
+            "and the wire is not in sequence order"
+        );
     }
 }

@@ -42,3 +42,35 @@ pub enum TraceEvent {
         marker_value: Option<u32>,
     },
 }
+
+#[cfg(feature = "enabled")]
+impl TraceEvent {
+    /// The sequence number assigned when this event was recorded.
+    ///
+    /// Zero until [`set_sequence`] is called; the transport forwards whatever is
+    /// here rather than numbering the event itself, so that a frame lost between
+    /// the recording layer and the wire still leaves a gap (EXEC-TRACE-002 §5.7).
+    ///
+    /// [`set_sequence`]: TraceEvent::set_sequence
+    #[must_use]
+    pub fn sequence(&self) -> u32 {
+        match self {
+            TraceEvent::SpanStart { sequence, .. }
+            | TraceEvent::SpanEnd { sequence, .. }
+            | TraceEvent::Marker { sequence, .. } => *sequence,
+        }
+    }
+
+    /// Stamps this event with its record-time sequence number.
+    ///
+    /// Called by the recording layer immediately before handing the event to the
+    /// transport, so that the window in which a preempting ISR can take a later
+    /// number and reach the queue first is as narrow as possible.
+    pub fn set_sequence(&mut self, value: u32) {
+        match self {
+            TraceEvent::SpanStart { sequence, .. }
+            | TraceEvent::SpanEnd { sequence, .. }
+            | TraceEvent::Marker { sequence, .. } => *sequence = value,
+        }
+    }
+}

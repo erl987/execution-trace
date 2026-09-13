@@ -33,13 +33,26 @@ RESET_THRESHOLD: int = DEFAULT_MODULUS >> 1
 
 
 class SequenceTracker:
-    """Detects device resets by watching for backwards sequence number jumps.
+    """Tracks a frame sequence, reporting loss and device resets.
 
-    Embedded firmware typically increments a 32-bit sequence counter with every
-    frame. When the device resets (panic, watchdog, or reflash), the counter
-    starts over at zero on the same connection. This class distinguishes a reset
-    (counter jumped backward by more than half the u32 range) from ordinary
-    packet loss (small forward gap).
+    Embedded firmware increments a counter with every frame. A hole in the
+    numbers is loss; a large backwards jump is the counter starting over, which
+    means the device reset.
+
+    Reordering:
+        With a *reorder_window* above zero the tracker tolerates frames arriving
+        slightly out of order before calling a hole loss. The execution-trace v2
+        format needs this: a frame is numbered by its producer, before it reaches
+        the queue the transport drains (EXEC-TRACE-002 §5.7), so an ISR that
+        preempts a task between those two points takes a later number and reaches
+        the wire first. The transport's own frames — the stream header and the
+        dictionary — are numbered when written and can likewise overtake events
+        already queued.
+
+        A hole is therefore only reported once a number arrives more than
+        *reorder_window* ahead of it, which bounds how long the report is
+        delayed. Single-producer streams should leave the window at zero and get
+        the report immediately.
 
     Args:
         label: Human-readable stream name used in log messages.
@@ -47,21 +60,44 @@ class SequenceTracker:
             range; the execution-trace v2 format wraps far earlier, at
             :data:`execution_trace.decode.SEQUENCE_MODULUS`, because the counter
             exists only to detect gaps and a gap is read modulo the wrap.
+        reorder_window: How far ahead a number may arrive before the numbers it
+            skipped are declared lost. Zero means strictly ordered.
+
+    Attributes:
+        dropped: Running total of frames reported lost.
 
     Raises:
         ValueError: If *modulus* is not a positive power of two, which the
             masking arithmetic below assumes.
     """
 
-    def __init__(self, label: str = "Frame", modulus: int = DEFAULT_MODULUS) -> None:
+    def __init__(
+        self,
+        label: str = "Frame",
+        modulus: int = DEFAULT_MODULUS,
+        reorder_window: int = 0,
+    ) -> None:
         if modulus <= 0 or modulus & (modulus - 1):
             raise ValueError(f"modulus must be a positive power of two, got {modulus}")
-        self._last: int | None = None
+        if not 0 <= reorder_window < modulus // 2:
+            raise ValueError(
+                f"reorder_window must be in [0, {modulus // 2}), got {reorder_window}"
+            )
         self._label = label
         self._modulus = modulus
         self._mask = modulus - 1
         # Half the range: a larger apparent forward jump is really a backward one.
         self._reset_threshold = modulus >> 1
+        self._window = reorder_window
+        self._expected: int | None = None
+        # Numbers seen ahead of _expected, still within the window.
+        self._pending: set[int] = set()
+        self.dropped = 0
+
+    @property
+    def _last(self) -> int | None:
+        """The last number consumed in order, or ``None`` before the first."""
+        return None if self._expected is None else (self._expected - 1) & self._mask
 
     def observe(self, sequence: int) -> bool:
         """Record a sequence number and detect resets or drops.
@@ -70,33 +106,82 @@ class SequenceTracker:
             sequence: The sequence number from the received frame.
 
         Returns:
-            ``True`` if a device reset was detected (sequence jumped backward),
-            ``False`` for normal sequential frames or ordinary packet drops.
-
-        Note:
-            After a reset is detected, ``_last`` is cleared so the very next
-            frame — whatever its sequence number — is accepted silently as the
-            new baseline.
+            ``True`` if a device reset was detected (the counter jumped far
+            backwards), ``False`` otherwise — including for ordinary loss, which
+            is logged and counted rather than signalled.
         """
-        # Mask to emulate the firmware's unsigned counter math in Python, so
-        # increment and subtraction behave correctly across a wraparound.
-        if self._last is not None:
-            expected = (self._last + 1) & self._mask
-            if sequence != expected:
-                dropped = (sequence - expected) & self._mask
-                if dropped > self._reset_threshold:
-                    logger.warning(
-                        "%s: device reset detected, resuming from #%d",
-                        self._label, sequence,
-                    )
-                    self._last = None
-                    return True
-                logger.warning(
-                    "%s drop detected: expected #%d, got #%d (%d dropped)",
-                    self._label, expected, sequence, dropped,
-                )
-        self._last = sequence
+        if self._expected is None:
+            self._expected = (sequence + 1) & self._mask
+            return False
+        expected = self._expected
+
+        # Distance forward from what we expect next, in the counter's own
+        # arithmetic. Anything past the halfway point is really a step backwards.
+        ahead = (sequence - expected) & self._mask
+
+        if ahead > self._reset_threshold:
+            behind = self._modulus - ahead
+            if behind <= self._window:
+                # A frame that overtook us earlier and is only now arriving, or a
+                # duplicate. Either way it fills nothing we have not moved past.
+                self._pending.discard(sequence)
+                return False
+            logger.warning(
+                "%s: device reset detected, resuming from #%d", self._label, sequence
+            )
+            self._reset_to(sequence)
+            return True
+
+        if ahead == 0:
+            self._expected = self._absorb_pending((sequence + 1) & self._mask)
+            return False
+
+        if ahead <= self._window:
+            # Early: hold it and wait for the numbers it skipped.
+            self._pending.add(sequence)
+            return False
+
+        # Past the window, so whatever is still missing is genuinely lost.
+        missing = ahead - sum(
+            1 for p in self._pending if (p - expected) & self._mask < ahead
+        )
+        if missing > 0:
+            self.dropped += missing
+            logger.warning(
+                "%s drop detected: expected #%d, got #%d (%d dropped)",
+                self._label, expected, sequence, missing,
+            )
+        resumed = (sequence + 1) & self._mask
+        self._discard_passed(resumed)
+        self._expected = self._absorb_pending(resumed)
         return False
+
+    def _reset_to(self, sequence: int) -> None:
+        """Drop all state so the next frame, whatever its number, is the baseline.
+
+        The resetting frame is not itself taken as the baseline: the counter has
+        restarted and the first numbers of the new run are as likely to be
+        reordered as any others, so anchoring on one of them would manufacture a
+        gap. Callers that want an exact anchor re-observe on a fresh tracker.
+        """
+        del sequence
+        self._expected = None
+        self._pending.clear()
+
+    def _absorb_pending(self, expected: int) -> int:
+        """Advance *expected* past any numbers already held that continue the run."""
+        while expected in self._pending:
+            self._pending.discard(expected)
+            expected = (expected + 1) & self._mask
+        return expected
+
+    def _discard_passed(self, expected: int) -> None:
+        """Forget held numbers that now sit behind *expected*."""
+        self._pending = {
+            p
+            for p in self._pending
+            if (p - expected) & self._mask <= self._reset_threshold
+        }
 
 
 def iter_frames(buf: bytearray) -> Generator[bytes, None, None]:

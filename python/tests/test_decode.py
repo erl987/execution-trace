@@ -10,6 +10,7 @@ from conftest import StreamBuilder, make_frame
 
 from execution_trace._proto import tracing_pb2
 from execution_trace.decode import (
+    REORDER_WINDOW,
     RESET_BACKWARD_MARGIN_US,
     SEQUENCE_MODULUS,
     UNKNOWN_NAME,
@@ -312,13 +313,51 @@ class TestDecodeTracingStream:
         assert len(event_buffer.records) == 1
         assert head == bytearray()
 
-    def test_sequence_gap_is_reported(self, caplog):
-        stream = StreamBuilder().start().bytes()
-        # Skip a sequence number: the next frame claims 5, not 1.
-        stream += make_frame(tracing_pb2.MARKER, name_id=0, sequence=5)
+    def test_a_frame_lost_at_the_producer_queue_is_reported(self, caplog):
+        """AC 7: a frame dropped before the transport still shows as a gap.
+
+        The number is taken when the event is recorded, upstream of the queue the
+        transport drains, so a drop there burns a number and leaves a hole
+        (§5.7). Before increment 5 the transport numbered frames itself and this
+        loss was invisible — the host saw a contiguous stream with events simply
+        absent (§2.6).
+        """
+        state = TraceStreamState("test")
+        event_buffer = TraceEventBuffer()
+        state.names[1] = NameEntry(name="main_task")
+
+        stream = bytearray()
+        seq = 0
+        for i in range(REORDER_WINDOW + 4):
+            if i == 1:
+                seq += 1  # this one never reached the transport
+                continue
+            stream += make_frame(tracing_pb2.MARKER, name_id=1, sequence=seq)
+            seq += 1
+
         with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
-            _decode(stream)
+            decode_tracing_stream(stream, state, event_buffer)
+
         assert "drop detected" in caplog.text
+        assert "1 dropped" in caplog.text
+        assert state.tracker.dropped == 1
+
+    def test_reordered_frames_are_not_reported_as_loss(self, caplog):
+        # Producer-side numbering means an ISR can take a later number and reach
+        # the wire first. That is not loss and must not be reported as any.
+        state = TraceStreamState("test")
+        event_buffer = TraceEventBuffer()
+        state.names[1] = NameEntry(name="main_task")
+
+        stream = bytearray()
+        for seq in (0, 2, 1, 3, 5, 4, 6):
+            stream += make_frame(tracing_pb2.MARKER, name_id=1, sequence=seq)
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            decode_tracing_stream(stream, state, event_buffer)
+
+        assert caplog.text == ""
+        assert state.tracker.dropped == 0
+        assert len(event_buffer.markers) == 7, "every frame is still delivered"
 
     def test_sequence_wraps_at_the_modulus_without_a_false_reset(self, caplog):
         state = TraceStreamState("test")

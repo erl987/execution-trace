@@ -93,14 +93,20 @@ pub trait TraceSink: TraceTransport {
         let mut name: String<32> = String::new();
         name.push_str(source_name)
             .map_err(|_| TracingError::MessageDropped)?;
-        self.write_event(TraceEvent::SpanStart {
+        let mut event = TraceEvent::SpanStart {
             timestamp_ns: self.get_elapsed_nanoseconds(),
             name,
             source_type,
             sequence: 0,
             priority: u32::from(priority),
             relative_deadline_ms,
-        })
+        };
+        // Numbered here, not in the transport, so that an event lost at the
+        // producer queue still leaves a host-visible gap (§5.7). Taken as late
+        // as possible: everything between this and the enqueue is a window in
+        // which a preempting ISR can take a later number and arrive first.
+        event.set_sequence(crate::next_sequence());
+        self.write_event(event)
     }
 
     /// Records the end of a named execution span previously started with [`record_span_start`].
@@ -117,11 +123,13 @@ pub trait TraceSink: TraceTransport {
         let mut name: String<32> = String::new();
         name.push_str(source_name)
             .map_err(|_| TracingError::MessageDropped)?;
-        self.write_event(TraceEvent::SpanEnd {
+        let mut event = TraceEvent::SpanEnd {
             timestamp_ns: self.get_elapsed_nanoseconds(),
             name,
             sequence: 0,
-        })
+        };
+        event.set_sequence(crate::next_sequence());
+        self.write_event(event)
     }
 
     /// Records a point-in-time annotation. No matching `record_span_end` is needed.
@@ -143,12 +151,14 @@ pub trait TraceSink: TraceTransport {
         let mut name: String<32> = String::new();
         name.push_str(label)
             .map_err(|_| TracingError::MessageDropped)?;
-        self.write_event(TraceEvent::Marker {
+        let mut event = TraceEvent::Marker {
             timestamp_ns: self.get_elapsed_nanoseconds(),
             name,
             sequence: 0,
             marker_value: value,
-        })
+        };
+        event.set_sequence(crate::next_sequence());
+        self.write_event(event)
     }
 }
 
