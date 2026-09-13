@@ -144,6 +144,11 @@ class TraceStreamState:
         self.timebase: int = tracing_pb2.NANOSECONDS
         self.core_frequency_hz: int = 0
         self.source_mask: Optional[int] = None
+        # Ids already reported as unresolvable. At 1300+ events/s an unregistered
+        # id would otherwise log thousands of identical lines per second.
+        self._warned_ids: set[int] = set()
+        #: Events dropped because their name id could not be resolved.
+        self.unresolved_events: int = 0
 
     def reset(self) -> None:
         """Discard all per-stream state after a device reset.
@@ -153,6 +158,8 @@ class TraceStreamState:
         """
         self.tracker = SequenceTracker(self.label, modulus=SEQUENCE_MODULUS)
         self.names.clear()
+        self._warned_ids.clear()
+        self.unresolved_events = 0
         self.clock_ticks = 0
         self.timebase = tracing_pb2.NANOSECONDS
         self.core_frequency_hz = 0
@@ -190,27 +197,33 @@ class TraceStreamState:
             self.clock_ticks += frame.timestamp_ticks
         return self.ticks_to_us(self.clock_ticks)
 
-    def resolve(self, name_id: int) -> NameEntry:
+    def resolve(self, name_id: int) -> Optional[NameEntry]:
         """Look up a dictionary id.
 
         Args:
             name_id: The id carried by the frame.
 
         Returns:
-            The registered entry, or a placeholder entry when the id is the
-            reserved "unknown" value or has not been registered — which happens
-            when the device's registry was full, or when the host attached after
-            the entry was sent.
+            The registered entry, or ``None`` when the id cannot be resolved —
+            either the reserved "unknown" id, meaning the device's registry was
+            full, or an id whose ``NAME_REGISTERED`` frame the host never saw
+            because it attached after the entry was sent.
+
+            Callers must **drop** an unresolvable event rather than attribute it
+            to a placeholder name: distinct ids would otherwise share one lane,
+            and their spans would interleave into pairs that never existed.
         """
         entry = self.names.get(name_id)
         if entry is not None:
             return entry
-        if name_id != UNKNOWN_NAME_ID:
+        if name_id != UNKNOWN_NAME_ID and name_id not in self._warned_ids:
+            self._warned_ids.add(name_id)
             logger.warning(
-                "Tracing: name id %d was never registered — the host may have "
-                "attached mid-stream", name_id,
+                "Tracing: name id %d not resolvable yet — dropping its events "
+                "until the device's next dictionary refresh", name_id,
             )
-        return NameEntry(name=UNKNOWN_NAME)
+        self.unresolved_events += 1
+        return None
 
 
 class TraceEventBuffer:
@@ -323,11 +336,17 @@ def decode_tracing_stream(
             logger.warning("Failed to decode TraceFrame: %s", exc)
             continue
 
-        # A TRACE_START after the stream is already running means the device
-        # rebooted: its dictionary and clock both restarted, so nothing carried
-        # over is still valid.
-        if frame.event_type == tracing_pb2.TRACE_START and state.source_mask is not None:
-            logger.warning("Tracing: TRACE_START mid-stream — device reset")
+        # The device re-emits the header periodically so that a host attaching
+        # mid-run learns the timebase and the mask. That is not a reset — only a
+        # header whose absolute timestamp has gone *backwards* is, because the
+        # device clock restarts at zero on reboot and nothing carried over from
+        # before it is still valid.
+        if (
+            frame.event_type == tracing_pb2.TRACE_START
+            and state.source_mask is not None
+            and frame.timestamp_ticks < state.clock_ticks
+        ):
+            logger.warning("Tracing: device clock restarted — device reset")
             buf.clear()
             event_buffer.flush_pending()
             state.reset()
@@ -344,16 +363,19 @@ def decode_tracing_stream(
         if frame.event_type == tracing_pb2.TRACE_START:
             state.timebase = frame.timebase
             state.core_frequency_hz = frame.core_frequency_hz
+            first_header = state.source_mask is None
             state.source_mask = frame.source_mask
             # The clock was set from the raw ticks before the timebase was known;
             # it is a tick count either way, so only the conversion changes.
-            logger.info(
-                "Tracing: stream start, timebase=%s core=%d Hz source_mask=0x%02X",
-                tracing_pb2.TimeBase.Name(frame.timebase),
-                frame.core_frequency_hz,
-                frame.source_mask,
-            )
+            if first_header:
+                logger.info(
+                    "Tracing: stream start, timebase=%s core=%d Hz source_mask=0x%02X",
+                    tracing_pb2.TimeBase.Name(frame.timebase),
+                    frame.core_frequency_hz,
+                    frame.source_mask,
+                )
         elif frame.event_type == tracing_pb2.NAME_REGISTERED:
+            state._warned_ids.discard(frame.name_id)
             state.names[frame.name_id] = NameEntry(
                 name=frame.name,
                 source_type=frame.source_type,
@@ -365,7 +387,11 @@ def decode_tracing_stream(
                 ),
             )
         else:
-            event_buffer.push(frame, state.resolve(frame.name_id), timestamp_us)
+            entry = state.resolve(frame.name_id)
+            # An unresolvable id is dropped, not bucketed under a placeholder:
+            # see TraceStreamState.resolve.
+            if entry is not None:
+                event_buffer.push(frame, entry, timestamp_us)
 
 
 def write_tracing_csv(

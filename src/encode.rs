@@ -140,9 +140,23 @@ impl RawTraceFrame {
 ///
 /// [`TraceSink`]: crate::TraceSink
 pub struct TraceEncoder {
-    names: heapless::Vec<heapless::String<32>, NAME_REGISTRY_CAPACITY>,
+    names: heapless::Vec<DictionaryEntry, NAME_REGISTRY_CAPACITY>,
     last_ticks: u64,
     sequence: u32,
+}
+
+/// One dictionary entry: a name and everything fixed by it.
+///
+/// The attributes are kept, not just the name, so that the dictionary can be
+/// **re-emitted** in full ([`TraceEncoder::encode_dictionary_entry`]). A host
+/// that attaches after startup never saw the original frames, and without a
+/// re-emission every id it receives resolves to nothing.
+#[derive(Debug, Clone, PartialEq)]
+struct DictionaryEntry {
+    name: heapless::String<32>,
+    source_type: Option<SourceType>,
+    priority: u32,
+    relative_deadline_ms: Option<f32>,
 }
 
 impl TraceEncoder {
@@ -228,7 +242,10 @@ impl TraceEncoder {
         let mut name_registry_full = false;
 
         let name_id = match self.lookup(name) {
-            Some(id) => id,
+            Some(id) => {
+                self.backfill(id, event);
+                id
+            }
             None => match self.register(event, timestamp_ns, out) {
                 Ok((id, n)) => {
                     written += n;
@@ -278,9 +295,81 @@ impl TraceEncoder {
         let needle = name.as_bytes();
         self.names
             .iter()
-            .position(|candidate| candidate.len() == needle.len() && candidate.as_bytes() == needle)
+            .position(|candidate| {
+                candidate.name.len() == needle.len() && candidate.name.as_bytes() == needle
+            })
             // Ids are one-based: zero is reserved for "unknown".
             .and_then(|index| u32::try_from(index + 1).ok())
+    }
+
+    /// Fills in the attributes of an entry that was first registered without them.
+    ///
+    /// A name is normally first seen on its `SpanStart`, which carries the
+    /// attributes. It is seen first on a `SpanEnd` only when the `SpanStart` was
+    /// dropped upstream of the encoder — at the producer queue, under load — and
+    /// without this the priority and deadline for that name would stay lost for
+    /// the rest of the run.
+    fn backfill(&mut self, name_id: u32, event: &TraceEvent) {
+        let TraceEvent::SpanStart {
+            source_type,
+            priority,
+            relative_deadline_ms,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let Some(index) = usize::try_from(name_id)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+        else {
+            return;
+        };
+        let Some(entry) = self.names.get_mut(index) else {
+            return;
+        };
+        if entry.source_type.is_none() {
+            entry.source_type = Some(*source_type);
+            entry.priority = *priority;
+            entry.relative_deadline_ms = *relative_deadline_ms;
+        }
+    }
+
+    /// Re-encodes the dictionary entry at `index` as a `NAME_REGISTERED` frame.
+    ///
+    /// Each entry is otherwise sent once, when its name is first seen, so a host
+    /// that attaches later resolves every id to nothing. Re-emitting the whole
+    /// dictionary periodically is what makes a mid-run attach decodable: the
+    /// frames are identical to the originals apart from their timestamp and
+    /// sequence, and a host that already holds an entry overwrites it with the
+    /// same value.
+    ///
+    /// Returns `None` once `index` is past the end, so a caller can walk from
+    /// zero until it stops.
+    ///
+    /// # Errors
+    /// Returns [`TracingEncodeError::BufferFull`] if `out` is too small.
+    pub fn encode_dictionary_entry(
+        &mut self,
+        index: usize,
+        timestamp_ticks: u64,
+        out: &mut [u8],
+    ) -> Option<Result<usize, TracingEncodeError>> {
+        let entry = self.names.get(index)?.clone();
+        let name_id = u32::try_from(index + 1).ok()?;
+        let sequence = self.next_sequence();
+        let mut frame = RawTraceFrame::new(
+            FrameKind::NameRegistered,
+            timestamp_ticks,
+            sequence,
+            name_id,
+        );
+        frame.name = entry.name;
+        frame.source_type = entry.source_type;
+        frame.priority = entry.priority;
+        frame.relative_deadline_ms = entry.relative_deadline_ms;
+        self.last_ticks = timestamp_ticks;
+        Some(encode_trace_frame(&frame, out))
     }
 
     /// Assigns the next id and writes the dictionary frame, whose timestamp is
@@ -307,7 +396,12 @@ impl TraceEncoder {
         };
 
         self.names
-            .push(name.clone())
+            .push(DictionaryEntry {
+                name: name.clone(),
+                source_type,
+                priority,
+                relative_deadline_ms,
+            })
             .map_err(|_| RegisterError::Full)?;
         let id = u32::try_from(self.names.len()).map_err(|_| RegisterError::Full)?;
 
@@ -683,6 +777,88 @@ mod tests {
         assert_eq!(decode_all(&bytes)[0].name_id, 1);
         let (bytes, _) = encode_one(&mut enc, &span_end("main_task", 0));
         assert_eq!(decode_all(&bytes)[0].name_id, 2);
+    }
+
+    // ── Dictionary refresh ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_dictionary_can_be_re_emitted_in_full() {
+        // What makes a mid-run host attach decodable: the device re-sends every
+        // entry, so ids it never saw registered become resolvable.
+        let mut enc = TraceEncoder::new();
+        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+        enc.encode(&span_start_with_deadline("gyro_isr", 0), &mut buf)
+            .unwrap();
+        enc.encode(&marker("ukf_predict", 0, None), &mut buf)
+            .unwrap();
+
+        let mut wire = Vec::new();
+        let mut index = 0;
+        while let Some(result) = enc.encode_dictionary_entry(index, 5_000, &mut buf) {
+            wire.extend_from_slice(&buf[..result.unwrap()]);
+            index += 1;
+        }
+        assert_eq!(index, 2, "one frame per entry, then it stops");
+
+        let frames = decode_all(&wire);
+        assert!(frames.iter().all(|f| f.kind == FrameKind::NameRegistered));
+        assert_eq!(frames[0].name_id, 1);
+        assert_eq!(frames[0].name.as_str(), "gyro_isr");
+        assert_eq!(frames[0].source_type, Some(SourceType::Isr));
+        assert_eq!(frames[0].priority, 8);
+        assert_eq!(frames[0].relative_deadline_ms, Some(0.5));
+        assert_eq!(frames[1].name_id, 2);
+        assert_eq!(frames[1].name.as_str(), "ukf_predict");
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_ids_it_originally_assigned() {
+        let mut enc = warmed(&["a", "b", "c"]);
+        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+        for index in 0..3 {
+            let n = enc
+                .encode_dictionary_entry(index, 0, &mut buf)
+                .unwrap()
+                .unwrap();
+            let frame = decode_all(&buf[..n]).remove(0);
+            assert_eq!(frame.name_id, u32::try_from(index + 1).unwrap());
+        }
+        // Following events still resolve to the same ids.
+        let (bytes, _) = encode_one(&mut enc, &span_end("b", 0));
+        assert_eq!(decode_all(&bytes)[0].name_id, 2);
+    }
+
+    #[test]
+    fn a_refresh_is_sequenced_so_it_cannot_look_like_a_gap() {
+        let mut enc = warmed(&["a"]);
+        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+        let before = enc.sequence();
+        enc.encode_dictionary_entry(0, 0, &mut buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(enc.sequence(), before + 1);
+    }
+
+    #[test]
+    fn a_name_first_seen_on_a_span_end_gains_its_attributes_later() {
+        // The SpanStart was dropped upstream of the encoder, so the entry is
+        // registered bare. When a later SpanStart for that name arrives the
+        // attributes must be filled in, or the refresh re-sends a bare entry
+        // and the priority is lost for the rest of the run.
+        let mut enc = TraceEncoder::new();
+        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
+        enc.encode(&span_end("gyro_isr", 0), &mut buf).unwrap();
+        enc.encode(&span_start_with_deadline("gyro_isr", 0), &mut buf)
+            .unwrap();
+
+        let n = enc
+            .encode_dictionary_entry(0, 0, &mut buf)
+            .unwrap()
+            .unwrap();
+        let frame = decode_all(&buf[..n]).remove(0);
+        assert_eq!(frame.source_type, Some(SourceType::Isr));
+        assert_eq!(frame.priority, 8);
+        assert_eq!(frame.relative_deadline_ms, Some(0.5));
     }
 
     // ── Delta timestamps (§5.6) ───────────────────────────────────────────────

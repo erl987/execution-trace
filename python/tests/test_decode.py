@@ -191,8 +191,18 @@ class TestTraceStreamState:
         state = TraceStreamState()
         with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
             entry = state.resolve(7)
-        assert entry.name == UNKNOWN_NAME
-        assert "never registered" in caplog.text
+        assert entry is None
+        assert "not resolvable yet" in caplog.text
+        assert state.unresolved_events == 1
+
+    def test_an_unresolvable_id_warns_only_once(self, caplog):
+        # At 1300+ events/s a per-event warning buries the log; the run that
+        # found this produced thousands of identical lines a second.
+        state = TraceStreamState()
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            for _ in range(50):
+                state.resolve(7)
+        assert caplog.text.count("not resolvable yet") == 1
 
     def test_the_reserved_unknown_id_resolves_silently(self, caplog):
         # Id 0 means the device's registry was full. That is reported by a
@@ -200,7 +210,7 @@ class TestTraceStreamState:
         state = TraceStreamState()
         with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
             entry = state.resolve(0)
-        assert entry.name == UNKNOWN_NAME
+        assert entry is None
         assert caplog.text == ""
 
     def test_reset_clears_the_dictionary(self):
@@ -275,14 +285,16 @@ class TestDecodeTracingStream:
         assert r.priority == 8
         assert r.deadline_us == pytest.approx(1_000.0)
 
-    def test_an_unregistered_id_still_yields_a_decodable_marker(self, builder, caplog):
-        # What the firmware emits when its name registry is full: the event goes
-        # out with the reserved id rather than being dropped or mis-decoded.
+    def test_an_event_with_the_reserved_unknown_id_is_dropped(self, builder, caplog):
+        # What the firmware emits when its name registry is full. The event is
+        # real, but nothing can say what it was, and attributing it to a shared
+        # placeholder would interleave unrelated spans into one lane. The
+        # firmware's TracingNameRegistryFull counter is what reports the loss.
         builder.event(tracing_pb2.MARKER, "", 1_000, marker_value=5, name_id=0)
         with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
-            _, event_buffer = _decode(builder.bytes())
-        assert event_buffer.markers[0].name == UNKNOWN_NAME
-        assert event_buffer.markers[0].value == 5
+            state, event_buffer = _decode(builder.bytes())
+        assert event_buffer.markers == [], "an unattributable event is dropped"
+        assert state.unresolved_events == 1
 
     def test_partial_frame_is_left_in_the_buffer(self, builder):
         builder.span("t", 0, 1_000)
@@ -312,8 +324,9 @@ class TestDecodeTracingStream:
         event_buffer = TraceEventBuffer()
         # Walk the tracker up to the last sequence before the wrap, then feed the
         # wrapped frame. A u32 tracker would read 0 after 16383 as a huge jump.
+        state.names[1] = NameEntry(name="tick")
         state.tracker.observe(SEQUENCE_MODULUS - 1)
-        stream = bytearray(make_frame(tracing_pb2.MARKER, name_id=0, sequence=0))
+        stream = bytearray(make_frame(tracing_pb2.MARKER, name_id=1, sequence=0))
         with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
             decode_tracing_stream(stream, state, event_buffer)
         assert caplog.text == ""
@@ -348,6 +361,60 @@ class TestDecodeTracingStream:
         assert "drop detected" in caplog.text
         assert "reset" not in caplog.text
         assert state.names == {1: NameEntry(name="stale")}
+
+    def test_a_dictionary_refresh_resolves_events_seen_before_it(self, builder):
+        # What a host attaching mid-run sees: events for ids it never saw
+        # registered, then the device's periodic re-emission of the dictionary.
+        state = TraceStreamState("test")
+        event_buffer = TraceEventBuffer()
+
+        # Events arrive with an id the host has no entry for.
+        orphan = bytearray()
+        orphan += make_frame(tracing_pb2.SPAN_START, name_id=1, sequence=0)
+        orphan += make_frame(tracing_pb2.SPAN_END, timestamp_ticks=500, name_id=1, sequence=1)
+        decode_tracing_stream(orphan, state, event_buffer)
+        assert event_buffer.records == [], "unresolvable events are dropped"
+        assert state.unresolved_events == 2
+
+        # The refresh arrives: the entry is now known, and later events resolve.
+        refresh = bytearray()
+        refresh += make_frame(
+            tracing_pb2.NAME_REGISTERED,
+            timestamp_ticks=10_000,
+            name_id=1,
+            sequence=2,
+            name="main_task",
+            source_type=tracing_pb2.TASK,
+            priority=4,
+        )
+        refresh += make_frame(tracing_pb2.SPAN_START, name_id=1, sequence=3)
+        refresh += make_frame(tracing_pb2.SPAN_END, timestamp_ticks=500, name_id=1, sequence=4)
+        decode_tracing_stream(refresh, state, event_buffer)
+
+        assert [r.name for r in event_buffer.records] == ["main_task"]
+        assert event_buffer.records[0].priority == 4
+
+    def test_a_repeated_header_is_not_a_reset(self, caplog):
+        # The device re-emits the header periodically so a late host learns the
+        # timebase and mask. Treating that as a reset would clear the dictionary
+        # every refresh and undo the very thing the refresh exists to fix.
+        builder = StreamBuilder().start(timestamp_ticks=1_000)
+        builder.span("t", 2_000, 3_000)
+        state, event_buffer = _decode(builder.bytes())
+        assert len(state.names) == 1
+
+        later = bytearray(
+            make_frame(
+                tracing_pb2.TRACE_START,
+                timestamp_ticks=9_000,
+                sequence=state.tracker._last + 1,
+                source_mask=0x1F,
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="execution_trace.decode"):
+            decode_tracing_stream(later, state, event_buffer)
+        assert "reset" not in caplog.text
+        assert len(state.names) == 1, "the dictionary must survive a refresh"
 
     def test_a_second_header_is_treated_as_a_device_reset(self, caplog):
         builder = StreamBuilder().start()
