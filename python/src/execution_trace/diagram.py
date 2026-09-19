@@ -280,7 +280,7 @@ def assign_lanes(df: "pd.DataFrame") -> "tuple[pd.DataFrame, list[str]]":
             if containing.empty:
                 return -1
             idx = containing["priority"].idxmax()
-            lane = cast(SupportsFloat, containing.loc[idx, "lane"])
+            lane = cast(SupportsFloat, containing.at[idx, "lane"])
             return int(float(lane))
 
         markers = markers.copy()
