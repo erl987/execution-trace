@@ -13,14 +13,17 @@ Usage::
 import argparse
 import sys
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, Union
 
 from execution_trace.decode import (
+    GapRecord,
+    MarkerRecord,
+    TraceEvent,
     TraceEventBuffer,
+    TraceStreamState,
     decode_tracing_stream,
     write_tracing_csv,
 )
-from execution_trace.stream import SequenceTracker
 
 
 def _die(msg: str) -> NoReturn:
@@ -60,12 +63,18 @@ def main() -> None:
     output_dir = args.output if args.output is not None else str(binary_path.parent)
 
     buf = bytearray(binary_path.read_bytes())
-    tracker = SequenceTracker("etrace-decode")
+    state = TraceStreamState("etrace-decode")
     event_buffer = TraceEventBuffer()
-    decode_tracing_stream(buf, tracker, event_buffer)
+    decode_tracing_stream(buf, state, event_buffer)
     event_buffer.flush_pending()
 
-    records = event_buffer.records + event_buffer.markers
+    # Gap rows carry the frames the link lost; without them the CSV shows an
+    # unexplained hole and interrupted spans with no reason beside them.
+    records: list[Union[TraceEvent, MarkerRecord, GapRecord]] = [
+        *event_buffer.records,
+        *event_buffer.markers,
+        *event_buffer.gaps,
+    ]
     csv_path = write_tracing_csv(records, output_dir=output_dir)
 
     if csv_path is None:

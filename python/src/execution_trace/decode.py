@@ -1,18 +1,24 @@
-"""High-level decoder for execution-trace protobuf streams.
+"""High-level decoder for execution-trace protobuf streams (wire format v2).
 
 Receives raw bytes from any transport (RTT, UART, TCP, …), parses
-length-delimited :class:`TraceEvent` protobuf frames, matches
-``SPAN_START`` / ``SPAN_END`` pairs into :class:`TraceEvent` records,
-and records :class:`MarkerRecord` annotations directly.
+length-delimited :class:`tracing_pb2.TraceFrame` frames, matches
+``SPAN_START`` / ``SPAN_END`` pairs into :class:`TraceEvent` records, and
+records :class:`MarkerRecord` annotations directly.
+
+A v2 frame is **not** self-contained: its name is a dictionary id assigned by an
+earlier ``NAME_REGISTERED`` frame, and its timestamp is a delta against the
+previous frame. Both are resolved here rather than on the device, which is why
+:class:`TraceStreamState` carries the dictionary, the running clock and the
+sequence tracker across every frame of one connection.
 
 Typical usage::
 
     buf = bytearray()
-    tracker = SequenceTracker("tracing")
+    state = TraceStreamState("tracing")
     event_buffer = TraceEventBuffer()
 
     # ... fill buf from hardware ...
-    decode_tracing_stream(buf, tracker, event_buffer)
+    decode_tracing_stream(buf, state, event_buffer)
 
     csv_path = write_tracing_csv(
         event_buffer.records + event_buffer.markers,
@@ -20,9 +26,11 @@ Typical usage::
     )
 """
 
+import collections
 import csv
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Union
@@ -31,6 +39,43 @@ from execution_trace._proto import tracing_pb2
 from execution_trace.stream import SequenceTracker, iter_frames
 
 logger = logging.getLogger(__name__)
+
+# The firmware's sequence counter wraps here rather than at 2**32: it exists only
+# to detect gaps, a gap is read modulo the wrap, and a full 32-bit counter would
+# spend up to five varint bytes per frame to buy nothing.
+SEQUENCE_MODULUS: int = 16_384
+
+# Reserved dictionary id, emitted when the device's name registry is full. The
+# stream stays decodable; the name of that one event is lost.
+UNKNOWN_NAME_ID: int = 0
+
+UNKNOWN_NAME: str = "<unknown>"
+
+# How many recent frames to remember the arrival time of, for placing a hole the
+# reorder window only reveals later. Comfortably more than REORDER_WINDOW.
+SEEN_HISTORY: int = 512
+
+# How far a frame may arrive ahead of a missing one before that one is called
+# lost.
+#
+# Frames are numbered by their producer, before the queue the transport drains,
+# so an ISR preempting a task between those two points takes a later number and
+# reaches the wire first. The transport's own frames — the header and the
+# dictionary — are numbered when written and can overtake events already queued,
+# which bounds the reordering by the depth of that queue rather than by the
+# preemption window. 64 covers the 48-slot channel with margin; the cost of the
+# margin is only that a genuine loss is reported this many frames later.
+REORDER_WINDOW: int = 64
+
+# How far the device clock must appear to jump *backwards* on a TRACE_START
+# before it is read as a reboot rather than as ordering jitter.
+#
+# A reboot restarts the clock at zero, so it shows up as the whole uptime — many
+# seconds. Jitter is microseconds: the header's timestamp is read after the
+# producer queue is drained, but an event recorded just before that read can
+# still be encoded after it. Treating a microsecond inversion as a reboot would
+# throw the dictionary away and blind the trace for a whole refresh interval.
+RESET_BACKWARD_MARGIN_US: float = 1_000_000.0
 
 
 @dataclass
@@ -56,6 +101,32 @@ class TraceEvent:
     priority: int = 0
     deadline_us: Optional[float] = None
     value: Optional[int] = None
+    #: The span was cut short by a gap rather than closed by its own ``SPAN_END``
+    #: — its real end is unknown and at least ``end_us`` (§5.9).
+    interrupted: bool = False
+
+
+@dataclass
+class GapRecord:
+    """A stretch of the trace where frames were lost.
+
+    Emitted as a row of its own so that missing data *looks* missing. Silent
+    truncation is what made a 2 % frame-loss rate read as a broken instrument
+    (§2.5).
+
+    Attributes:
+        name: Fixed label, so the row reads for itself in the CSV.
+        type: Always ``"gap"``.
+        start_us: Timestamp of the last frame received before the hole.
+        end_us: Timestamp of the first frame received after it.
+        frames_lost: How many frames the sequence says are missing.
+    """
+
+    start_us: float
+    end_us: float
+    frames_lost: int
+    name: str = "trace gap"
+    type: str = field(default="gap", init=False)
 
 
 @dataclass
@@ -77,6 +148,170 @@ class MarkerRecord:
     value: Optional[int] = None
 
 
+@dataclass
+class NameEntry:
+    """One dictionary entry: everything fixed by a span or marker name.
+
+    These attributes are sent once, on the ``NAME_REGISTERED`` frame that assigns
+    the id, rather than repeated on every occurrence of the event.
+
+    Attributes:
+        name: Task, ISR or marker label.
+        source_type: ``tracing_pb2.ISR`` or ``tracing_pb2.TASK``.
+        priority: Scheduler priority; 0 when the name was first seen on a frame
+            that carries no attributes (a ``SPAN_END`` or ``MARKER``).
+        relative_deadline_ms: Deadline relative to activation, or ``None``.
+    """
+
+    name: str
+    source_type: int = tracing_pb2.TRACE_EVENT_SOURCE_TYPE_UNSPECIFIED
+    priority: int = 0
+    relative_deadline_ms: Optional[float] = None
+
+
+class TraceStreamState:
+    """Per-connection decoder state for one v2 trace stream.
+
+    A v2 frame carries a dictionary id instead of a name and a delta instead of a
+    timestamp, so decoding is stateful: this holds the name dictionary, the
+    running clock the deltas accumulate into, the timebase declared by the
+    ``TRACE_START`` frame, and the sequence tracker that detects gaps and resets.
+
+    Create one per connection — the device's dictionary and clock both restart
+    when it does.
+
+    Args:
+        label: Human-readable stream name used in log messages.
+
+    Attributes:
+        source_mask: The source-group mask the firmware was built with, or
+            ``None`` until a ``TRACE_START`` frame arrives. A group absent from
+            the mask is silent by design, which is what distinguishes it from a
+            group whose frames were lost.
+    """
+
+    def __init__(self, label: str = "Trace event") -> None:
+        self.label = label
+        self.tracker = SequenceTracker(
+            label, modulus=SEQUENCE_MODULUS, reorder_window=REORDER_WINDOW
+        )
+        self.names: dict[int, NameEntry] = {}
+        #: Reconstructed device time, in ticks. Signed, because a frame's delta
+        #: can be negative — see the `timestamp_ticks` field comment in the proto.
+        self.clock_ticks: int = 0
+        self.timebase: int = tracing_pb2.NANOSECONDS
+        self.core_frequency_hz: int = 0
+        self.source_mask: Optional[int] = None
+        # Ids already reported as unresolvable. At 1300+ events/s an unregistered
+        # id would otherwise log thousands of identical lines per second.
+        self._warned_ids: set[int] = set()
+        #: Events dropped because their name id could not be resolved.
+        self.unresolved_events: int = 0
+        # sequence -> absolute timestamp, for the most recent frames. A hole is
+        # reported up to REORDER_WINDOW frames after it happened, so locating it
+        # in time means looking up the numbers either side of it rather than
+        # using whatever frame happened to trigger the report.
+        self._seen_at: collections.OrderedDict[int, float] = collections.OrderedDict()
+
+    def reset(self) -> None:
+        """Discard all per-stream state after a device reset.
+
+        The dictionary must go with it: the device reassigns ids from one on
+        reboot, so a stale entry would resolve a new id to the wrong name.
+        """
+        self.tracker = SequenceTracker(
+            self.label, modulus=SEQUENCE_MODULUS, reorder_window=REORDER_WINDOW
+        )
+        self.names.clear()
+        self._warned_ids.clear()
+        self.unresolved_events = 0
+        self.clock_ticks = 0
+        self.timebase = tracing_pb2.NANOSECONDS
+        self.core_frequency_hz = 0
+        self.source_mask = None
+
+    def ticks_to_us(self, ticks: int) -> float:
+        """Convert a tick count to microseconds using the declared timebase.
+
+        Args:
+            ticks: A tick count in the unit the ``TRACE_START`` frame declared.
+
+        Returns:
+            The equivalent duration in microseconds.
+        """
+        if self.timebase == tracing_pb2.CYCLES and self.core_frequency_hz > 0:
+            return ticks * 1_000_000.0 / self.core_frequency_hz
+        return ticks / 1_000.0
+
+    def advance(self, frame: tracing_pb2.TraceFrame) -> float:
+        """Advance the stream clock by *frame* and return its absolute time in µs.
+
+        ``NAME_REGISTERED`` and ``TRACE_START`` frames carry an absolute
+        timestamp and re-establish the origin; every other frame carries a delta
+        against the frame before it.
+
+        Args:
+            frame: The decoded frame.
+
+        Returns:
+            The frame's absolute timestamp in microseconds.
+        """
+        if frame.event_type in (tracing_pb2.NAME_REGISTERED, tracing_pb2.TRACE_START):
+            self.clock_ticks = frame.timestamp_ticks
+        else:
+            self.clock_ticks += frame.timestamp_ticks
+        return self.ticks_to_us(self.clock_ticks)
+
+    def note_seen(self, sequence: int, timestamp_us: float) -> None:
+        """Remember when a numbered frame arrived, for locating a later-found hole."""
+        self._seen_at[sequence] = timestamp_us
+        while len(self._seen_at) > SEEN_HISTORY:
+            self._seen_at.popitem(last=False)
+
+    def gap_bounds(self, first_missing: int, count: int) -> Optional[tuple[float, float]]:
+        """Timestamps bracketing a hole, from the frames either side of it.
+
+        Returns ``None`` when neither neighbour is still in history, which leaves
+        the gap unplaceable — it is then reported in the log only.
+        """
+        before = self._seen_at.get((first_missing - 1) % SEQUENCE_MODULUS)
+        after = self._seen_at.get((first_missing + count) % SEQUENCE_MODULUS)
+        if before is None and after is None:
+            return None
+        start = before if before is not None else after
+        end = after if after is not None else before
+        assert start is not None and end is not None  # noqa: S101 - narrowing for mypy
+        return (start, max(end, start))
+
+    def resolve(self, name_id: int) -> Optional[NameEntry]:
+        """Look up a dictionary id.
+
+        Args:
+            name_id: The id carried by the frame.
+
+        Returns:
+            The registered entry, or ``None`` when the id cannot be resolved —
+            either the reserved "unknown" id, meaning the device's registry was
+            full, or an id whose ``NAME_REGISTERED`` frame the host never saw
+            because it attached after the entry was sent.
+
+            Callers must **drop** an unresolvable event rather than attribute it
+            to a placeholder name: distinct ids would otherwise share one lane,
+            and their spans would interleave into pairs that never existed.
+        """
+        entry = self.names.get(name_id)
+        if entry is not None:
+            return entry
+        if name_id != UNKNOWN_NAME_ID and name_id not in self._warned_ids:
+            self._warned_ids.add(name_id)
+            logger.warning(
+                "Tracing: name id %d not resolvable yet — dropping its events "
+                "until the device's next dictionary refresh", name_id,
+            )
+        self.unresolved_events += 1
+        return None
+
+
 class TraceEventBuffer:
     """Accumulates :class:`TraceEvent` records by matching ``SPAN_START`` / ``SPAN_END`` pairs.
 
@@ -87,50 +322,114 @@ class TraceEventBuffer:
     """
 
     def __init__(self) -> None:
-        # name → (timestamp_ns, source_type, priority, relative_deadline_ms)
-        self._pending: dict[str, tuple[int, int, int, Optional[float]]] = {}
+        # name → (start_us, NameEntry)
+        self._pending: dict[str, tuple[float, NameEntry]] = {}
         self._records: list[TraceEvent] = []
         self._markers: list[MarkerRecord] = []
+        self._gaps: list[GapRecord] = []
+        # Names whose span a gap cut short. The next SPAN_END for each is the
+        # other half of a pair whose START is already closed, so it is dropped
+        # rather than paired with a later, unrelated START (§5.9).
+        self._orphaned_ends: set[str] = set()
 
-    def push(self, msg: tracing_pb2.TraceEvent) -> None:
-        """Process one decoded :class:`tracing_pb2.TraceEvent`.
+    def push(
+        self,
+        frame: tracing_pb2.TraceFrame,
+        entry: NameEntry,
+        timestamp_us: float,
+    ) -> None:
+        """Process one decoded frame whose name and timestamp are already resolved.
 
         Args:
-            msg: Decoded protobuf message from the firmware.
+            frame: The decoded frame, for its event type and marker value.
+            entry: The dictionary entry its ``name_id`` resolves to.
+            timestamp_us: Its absolute timestamp in microseconds.
         """
-        name = msg.name
-        if msg.event_type == tracing_pb2.SPAN_START:
+        name = entry.name
+        if frame.event_type == tracing_pb2.SPAN_START:
             if name in self._pending:
                 logger.warning("Tracing: duplicate START for '%s' — discarding previous", name)
-            relative_deadline_ms = msg.relative_deadline_ms if msg.HasField("relative_deadline_ms") else None
-            self._pending[name] = (msg.timestamp_ns, msg.source_type, int(msg.priority), relative_deadline_ms)
-        elif msg.event_type == tracing_pb2.SPAN_END:
+            self._pending[name] = (timestamp_us, entry)
+        elif frame.event_type == tracing_pb2.SPAN_END:
+            if name in self._orphaned_ends:
+                # Its START was closed by interrupt_open_spans; pairing this with
+                # whatever opens next would invent a span that never ran.
+                self._orphaned_ends.discard(name)
+                return
             if name not in self._pending:
                 logger.warning("Tracing: END for '%s' with no matching START — discarding", name)
                 return
-            start_ns, source_type, priority, relative_deadline_ms = self._pending.pop(name)
-            type_str = "isr" if source_type == tracing_pb2.ISR else "task"
-            start_us = start_ns / 1_000.0
-            deadline_us = start_us + relative_deadline_ms * 1_000.0 if relative_deadline_ms is not None else None
+            start_us, start_entry = self._pending.pop(name)
+            type_str = "isr" if start_entry.source_type == tracing_pb2.ISR else "task"
+            deadline_us = (
+                start_us + start_entry.relative_deadline_ms * 1_000.0
+                if start_entry.relative_deadline_ms is not None
+                else None
+            )
             self._records.append(
                 TraceEvent(
                     name=name,
                     type=type_str,
                     start_us=start_us,
-                    end_us=msg.timestamp_ns / 1_000.0,
-                    priority=priority,
+                    end_us=timestamp_us,
+                    priority=start_entry.priority,
                     deadline_us=deadline_us,
                 )
             )
-        elif msg.event_type == tracing_pb2.MARKER:
-            value = int(msg.marker_value) if msg.HasField("marker_value") else None
+        elif frame.event_type == tracing_pb2.MARKER:
+            value = int(frame.marker_value) if frame.HasField("marker_value") else None
             self._markers.append(
-                MarkerRecord(
+                MarkerRecord(name=name, timestamp_us=timestamp_us, value=value)
+            )
+
+    def interrupt_open_spans(self, at_us: float, frames_lost: int, resumed_us: float) -> None:
+        """Close every span open at a gap, and record the gap itself.
+
+        A span whose ``SPAN_END`` was lost would otherwise stay open until the
+        next unrelated end for that name, producing one enormous bar across the
+        hole and well past it — which is the visual damage §2.5 describes. Each
+        open span is instead cut at the last frame before the gap and marked
+        interrupted, so the diagram shows a span of unknown length rather than a
+        wrong one.
+
+        Args:
+            at_us: Timestamp of the last frame received before the hole.
+            frames_lost: How many frames the sequence says are missing.
+            resumed_us: Timestamp of the first frame received after it.
+        """
+        self._gaps.append(
+            GapRecord(start_us=at_us, end_us=max(resumed_us, at_us), frames_lost=frames_lost)
+        )
+        # Only spans that were already running when the hole happened. The
+        # reorder window means this is discovered up to 64 frames later, by which
+        # time other spans have opened — and one that started after the hole
+        # cannot have been affected by it.
+        caught = [
+            (name, value) for name, value in self._pending.items() if value[0] <= at_us
+        ]
+        for name, (start_us, entry) in caught:
+            self._records.append(
+                TraceEvent(
                     name=name,
-                    timestamp_us=msg.timestamp_ns / 1_000.0,
-                    value=value,
+                    type="isr" if entry.source_type == tracing_pb2.ISR else "task",
+                    start_us=start_us,
+                    end_us=at_us,
+                    priority=entry.priority,
+                    deadline_us=(
+                        start_us + entry.relative_deadline_ms * 1_000.0
+                        if entry.relative_deadline_ms is not None
+                        else None
+                    ),
+                    interrupted=True,
                 )
             )
+            self._orphaned_ends.add(name)
+            del self._pending[name]
+
+    @property
+    def gaps(self) -> list[GapRecord]:
+        """Gap records in arrival order."""
+        return list(self._gaps)
 
     def flush_pending(self) -> None:
         """Warn about any unmatched ``SPAN_START`` events and clear pending state.
@@ -156,35 +455,113 @@ class TraceEventBuffer:
 
 def decode_tracing_stream(
     buf: bytearray,
-    tracker: SequenceTracker,
+    state: TraceStreamState,
     event_buffer: TraceEventBuffer,
 ) -> None:
     """Decode all complete frames from *buf* and push events into *event_buffer*.
 
-    Consumes *buf* in-place. Stops and clears *buf* if a device reset is detected
-    (sequence number jumped backward), also calling :meth:`TraceEventBuffer.flush_pending`.
+    Consumes *buf* in-place. Resolves each frame's dictionary id and delta
+    timestamp against *state*, which must be the same object across every call
+    for one connection.
+
+    On a detected device reset, resets *state* and calls
+    :meth:`TraceEventBuffer.flush_pending`, then carries on parsing. It does
+    **not** discard *buf*: the stream is length-prefixed with no sync marker, so
+    dropping bytes mid-frame leaves every following frame misaligned and
+    unrecoverable.
 
     Args:
         buf: Mutable byte buffer containing raw RTT / transport bytes.
-        tracker: Sequence number tracker shared across calls for the same stream.
+        state: Per-connection decoder state, shared across calls for one stream.
         event_buffer: Accumulator for decoded events.
     """
     for raw in iter_frames(buf):
-        msg = tracing_pb2.TraceEvent()
+        frame = tracing_pb2.TraceFrame()
         try:
-            msg.ParseFromString(raw)
+            frame.ParseFromString(raw)
         except Exception as exc:
-            logger.warning("Failed to decode TraceEvent: %s", exc)
+            logger.warning("Failed to decode TraceFrame: %s", exc)
             continue
-        if tracker.observe(msg.sequence):
-            buf.clear()
+
+        # A device reset invalidates everything carried over: the dictionary is
+        # reassigned from id one and the clock restarts at zero, so a stale entry
+        # would resolve a new id to an old name. Two things reveal one.
+        #
+        # The device re-emits the header periodically so that a host attaching
+        # mid-run learns the timebase and the mask, so a header alone is not a
+        # reset — only one whose absolute timestamp has gone *far* backwards,
+        # which separates a reboot from ordering jitter (RESET_BACKWARD_MARGIN_US).
+        clock_restarted = (
+            frame.event_type == tracing_pb2.TRACE_START
+            and state.source_mask is not None
+            and state.ticks_to_us(state.clock_ticks - frame.timestamp_ticks)
+            > RESET_BACKWARD_MARGIN_US
+        )
+        if clock_restarted or state.tracker.observe(frame.sequence):
+            if clock_restarted:
+                logger.warning("Tracing: device clock restarted — device reset")
             event_buffer.flush_pending()
-            break
-        event_buffer.push(msg)
+            state.reset()
+            # Seed the fresh tracker from this frame so gap detection is exact
+            # from the reset onward rather than from the frame after it.
+            state.tracker.observe(frame.sequence)
+            # Then fall through and process this frame: it is the first frame of
+            # the new run — often the reboot's own header, carrying the timebase
+            # and mask — and skipping it would leave the stream unattributed
+            # until the next refresh.
+            #
+            # Deliberately no `buf.clear()`: the frames after this point are
+            # intact and correctly delimited, and discarding bytes mid-frame
+            # would misalign the rest of the stream permanently.
+
+        timestamp_us = state.advance(frame)
+        state.note_seen(frame.sequence, timestamp_us)
+
+        # A hole the tracker has just become certain of. Close whatever was open
+        # across it, so a span whose end was lost does not run on for ever, and
+        # record the gap as a row of its own (§5.9).
+        if state.tracker.last_gap is not None:
+            first_missing, lost = state.tracker.last_gap
+            bounds = state.gap_bounds(first_missing, lost)
+            if bounds is not None:
+                event_buffer.interrupt_open_spans(bounds[0], lost, bounds[1])
+
+        if frame.event_type == tracing_pb2.TRACE_START:
+            state.timebase = frame.timebase
+            state.core_frequency_hz = frame.core_frequency_hz
+            first_header = state.source_mask is None
+            state.source_mask = frame.source_mask
+            # The clock was set from the raw ticks before the timebase was known;
+            # it is a tick count either way, so only the conversion changes.
+            if first_header:
+                logger.info(
+                    "Tracing: stream start, timebase=%s core=%d Hz source_mask=0x%02X",
+                    tracing_pb2.TimeBase.Name(frame.timebase),
+                    frame.core_frequency_hz,
+                    frame.source_mask,
+                )
+        elif frame.event_type == tracing_pb2.NAME_REGISTERED:
+            state._warned_ids.discard(frame.name_id)
+            state.names[frame.name_id] = NameEntry(
+                name=frame.name,
+                source_type=frame.source_type,
+                priority=int(frame.priority),
+                relative_deadline_ms=(
+                    frame.relative_deadline_ms
+                    if frame.HasField("relative_deadline_ms")
+                    else None
+                ),
+            )
+        else:
+            entry = state.resolve(frame.name_id)
+            # An unresolvable id is dropped, not bucketed under a placeholder:
+            # see TraceStreamState.resolve.
+            if entry is not None:
+                event_buffer.push(frame, entry, timestamp_us)
 
 
 def write_tracing_csv(
-    records: list[Union[TraceEvent, MarkerRecord]],
+    records: Sequence[Union[TraceEvent, MarkerRecord, GapRecord]],
     output_dir: str = "data",
 ) -> Optional[str]:
     """Write span and marker records to a timestamped CSV file.
@@ -209,7 +586,10 @@ def write_tracing_csv(
     +---------------+------------------------------------------+
     | ``deadline_us``| absolute deadline in µs, or empty       |
     +---------------+------------------------------------------+
-    | ``value``     | optional u32 payload, or empty           |
+    | ``value``     | optional u32 payload; frames lost on a   |
+    |               | ``gap`` row, or empty                    |
+    +---------------+------------------------------------------+
+    | ``interrupted``| ``1`` when a gap cut the span short     |
     +---------------+------------------------------------------+
 
     Args:
@@ -230,21 +610,37 @@ def write_tracing_csv(
     path = os.path.join(output_dir, filename)
     latest = os.path.join(output_dir, "trace_latest.csv")
 
+    # An optional column is empty only when the field is absent. Testing the value for
+    # truth instead would write 0 as empty, and zero is a legitimate payload: a reason
+    # code, a count of nothing, a deadline at the activation instant.
+    def _optional(field: float | int | None) -> float | int | str:
+        return "" if field is None else field
+
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["name", "type", "start_us", "end_us", "priority", "deadline_us", "value"])
+        writer.writerow([
+            "name", "type", "start_us", "end_us", "priority", "deadline_us", "value",
+            "interrupted",
+        ])
         for r in records:
             if isinstance(r, MarkerRecord):
                 writer.writerow([
                     r.name, "marker",
                     r.timestamp_us, r.timestamp_us,
-                    0, "", r.value or "",
+                    0, "", _optional(r.value), 0,
+                ])
+            elif isinstance(r, GapRecord):
+                writer.writerow([
+                    r.name, "gap",
+                    r.start_us, r.end_us,
+                    0, "", r.frames_lost, 0,
                 ])
             else:
                 writer.writerow([
                     r.name, r.type,
                     r.start_us, r.end_us,
-                    r.priority, r.deadline_us or "", r.value or "",
+                    r.priority, _optional(r.deadline_us), _optional(r.value),
+                    int(r.interrupted),
                 ])
 
     # Atomically replace the symlink so trace_latest.csv always points to newest.

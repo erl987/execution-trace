@@ -210,3 +210,82 @@ class TestIterFrames:
         frames = list(iter_frames(buf))
         assert frames == [b""]
         assert buf == bytearray()
+
+
+class TestSequenceTrackerReordering:
+    """The v2 trace stream numbers frames at their producer, so they can arrive
+    slightly out of order; see SequenceTracker's Reordering note."""
+
+    def _tracker(self, window: int = 4) -> SequenceTracker:
+        return SequenceTracker("Test", modulus=64, reorder_window=window)
+
+    def test_a_swapped_pair_is_not_reported_as_loss(self, caplog):
+        t = self._tracker()
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            for s in (10, 12, 11, 13):  # 12 overtook 11
+                assert t.observe(s) is False
+        assert caplog.text == ""
+        assert t.dropped == 0
+
+    def test_a_frame_arriving_late_within_the_window_closes_its_hole(self, caplog):
+        t = self._tracker()
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            for s in (10, 14, 13, 12, 11, 15):
+                t.observe(s)
+        assert caplog.text == ""
+        assert t.dropped == 0
+
+    def test_a_real_hole_is_reported_once_the_window_is_passed(self, caplog):
+        # 12 never arrives. Nothing is said until a frame lands more than the
+        # window past it, which bounds how late the report can be.
+        t = self._tracker(window=4)
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            for s in (10, 11, 13, 14, 15, 16):
+                t.observe(s)
+            assert t.dropped == 0, "still inside the window"
+            t.observe(17)
+        assert t.dropped == 1
+        assert "1 dropped" in caplog.text
+
+    def test_the_count_is_right_when_several_are_missing(self, caplog):
+        t = self._tracker(window=2)
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            t.observe(10)
+            t.observe(20)  # 11..19 missing, far past the window
+        assert t.dropped == 9
+
+    def test_a_window_does_not_hide_a_device_reset(self, caplog):
+        # Detectable only when the pre-reset counter was low in the range: from
+        # high in it a restart at zero is indistinguishable from a forward gap,
+        # which is why the trace decoder leans on TRACE_START instead.
+        t = self._tracker()
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            t.observe(10)
+            assert t.observe(0) is True
+        assert "device reset" in caplog.text
+
+    def test_a_late_arrival_after_its_hole_was_reported_is_ignored(self, caplog):
+        # The window has already passed the hole and called it lost; the straggler
+        # must not then be read as a backwards jump.
+        t = self._tracker(window=2)
+        t.observe(10)
+        t.observe(15)  # 11..14 declared lost
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            assert t.observe(14) is False
+        assert "reset" not in caplog.text
+
+    def test_zero_window_reports_immediately(self, caplog):
+        # Single-producer streams — attitude, status — keep strict ordering and
+        # should not have their gap reports delayed.
+        t = SequenceTracker("Strict", modulus=64, reorder_window=0)
+        with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
+            t.observe(10)
+            t.observe(12)
+        assert t.dropped == 1
+        assert "1 dropped" in caplog.text
+
+    def test_window_must_be_sane(self):
+        with pytest.raises(ValueError):
+            SequenceTracker("Test", modulus=64, reorder_window=32)
+        with pytest.raises(ValueError):
+            SequenceTracker("Test", modulus=64, reorder_window=-1)

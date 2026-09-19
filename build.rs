@@ -19,8 +19,9 @@ fn main() {
     generator.add_protoc_arg("-Iproto");
 
     // name carries the name of the source task/ISR (for spans) or the marker label.
+    // It appears only on NAME_REGISTERED frames, once per distinct name (§5.5).
     generator.configure(
-        ".tracing.TraceEvent.name",
+        ".tracing.TraceFrame.name",
         micropb_gen::Config::new()
             .string_type("heapless::String<$N>")
             .max_bytes(32),

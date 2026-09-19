@@ -24,17 +24,19 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rtracing.proto\x12\x07tracing\"\x9d\x02\n\nTraceEvent\x12\x14\n\x0ctimestamp_ns\x18\x01 \x01(\x04\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x32\n\x0bsource_type\x18\x03 \x01(\x0e\x32\x1d.tracing.TraceEventSourceType\x12+\n\nevent_type\x18\x04 \x01(\x0e\x32\x17.tracing.TraceEventType\x12\x10\n\x08sequence\x18\x05 \x01(\r\x12\x10\n\x08priority\x18\x06 \x01(\r\x12!\n\x14relative_deadline_ms\x18\x07 \x01(\x02H\x00\x88\x01\x01\x12\x19\n\x0cmarker_value\x18\x08 \x01(\rH\x01\x88\x01\x01\x42\x17\n\x15_relative_deadline_msB\x0f\n\r_marker_value*R\n\x14TraceEventSourceType\x12\'\n#TRACE_EVENT_SOURCE_TYPE_UNSPECIFIED\x10\x00\x12\x07\n\x03ISR\x10\x01\x12\x08\n\x04TASK\x10\x02*\\\n\x0eTraceEventType\x12 \n\x1cTRACE_EVENT_TYPE_UNSPECIFIED\x10\x00\x12\x0e\n\nSPAN_START\x10\x01\x12\x0c\n\x08SPAN_END\x10\x02\x12\n\n\x06MARKER\x10\x03\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rtracing.proto\x12\x07tracing\"\x86\x03\n\nTraceFrame\x12\x17\n\x0ftimestamp_ticks\x18\x01 \x01(\x12\x12\x0f\n\x07name_id\x18\x02 \x01(\r\x12+\n\nevent_type\x18\x03 \x01(\x0e\x32\x17.tracing.TraceEventType\x12\x10\n\x08sequence\x18\x04 \x01(\r\x12\x19\n\x0cmarker_value\x18\x05 \x01(\rH\x00\x88\x01\x01\x12\x0c\n\x04name\x18\x06 \x01(\t\x12\x32\n\x0bsource_type\x18\x07 \x01(\x0e\x32\x1d.tracing.TraceEventSourceType\x12\x10\n\x08priority\x18\x08 \x01(\r\x12!\n\x14relative_deadline_ms\x18\t \x01(\x02H\x01\x88\x01\x01\x12#\n\x08timebase\x18\n \x01(\x0e\x32\x11.tracing.TimeBase\x12\x19\n\x11\x63ore_frequency_hz\x18\x0b \x01(\r\x12\x13\n\x0bsource_mask\x18\x0c \x01(\rB\x0f\n\r_marker_valueB\x17\n\x15_relative_deadline_ms*R\n\x14TraceEventSourceType\x12\'\n#TRACE_EVENT_SOURCE_TYPE_UNSPECIFIED\x10\x00\x12\x07\n\x03ISR\x10\x01\x12\x08\n\x04TASK\x10\x02*\x82\x01\n\x0eTraceEventType\x12 \n\x1cTRACE_EVENT_TYPE_UNSPECIFIED\x10\x00\x12\x0e\n\nSPAN_START\x10\x01\x12\x0c\n\x08SPAN_END\x10\x02\x12\n\n\x06MARKER\x10\x03\x12\x13\n\x0fNAME_REGISTERED\x10\x04\x12\x0f\n\x0bTRACE_START\x10\x05*\'\n\x08TimeBase\x12\x0f\n\x0bNANOSECONDS\x10\x00\x12\n\n\x06\x43YCLES\x10\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'tracing_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_TRACEEVENTSOURCETYPE']._serialized_start=314
-  _globals['_TRACEEVENTSOURCETYPE']._serialized_end=396
-  _globals['_TRACEEVENTTYPE']._serialized_start=398
-  _globals['_TRACEEVENTTYPE']._serialized_end=490
-  _globals['_TRACEEVENT']._serialized_start=27
-  _globals['_TRACEEVENT']._serialized_end=312
+  _globals['_TRACEEVENTSOURCETYPE']._serialized_start=419
+  _globals['_TRACEEVENTSOURCETYPE']._serialized_end=501
+  _globals['_TRACEEVENTTYPE']._serialized_start=504
+  _globals['_TRACEEVENTTYPE']._serialized_end=634
+  _globals['_TIMEBASE']._serialized_start=636
+  _globals['_TIMEBASE']._serialized_end=675
+  _globals['_TRACEFRAME']._serialized_start=27
+  _globals['_TRACEFRAME']._serialized_end=417
 # @@protoc_insertion_point(module_scope)

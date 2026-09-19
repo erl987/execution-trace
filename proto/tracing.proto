@@ -1,15 +1,60 @@
 syntax = "proto3";
 package tracing;
 
-message TraceEvent {
-  uint64 timestamp_ns = 1;
-  string name = 2;
-  TraceEventSourceType source_type = 3;
-  TraceEventType event_type = 4;
-  uint32 sequence = 5;
-  uint32 priority = 6;
-  optional float relative_deadline_ms = 7;
-  optional uint32 marker_value = 8;
+// Execution-trace wire format v2.
+//
+// Not wire-compatible with v1. A v2 stream is recognised by its leading
+// TRACE_START frame; see §6.4.
+//
+// One flat message carries every frame class, discriminated by `event_type`,
+// rather than a `oneof` envelope. proto3 omits unset fields, so a per-occurrence
+// event pays nothing for the dictionary fields it does not use, where an
+// envelope would tax every event with a tag and a length (§18.1).
+//
+// Field numbers stay at or below 15 so that every tag costs a single byte.
+message TraceFrame {
+  // Ticks elapsed since the previous sequenced frame, in the timebase declared
+  // by the TRACE_START frame. Absolute, not a delta, on NAME_REGISTERED and
+  // TRACE_START frames, which re-establish the time origin (§5.6).
+  //
+  // **Signed**, because the delta can be negative: an event is timestamped when
+  // it is recorded, before it reaches the producer queue, so a high-priority ISR
+  // preempting a task between those two points puts a later timestamp ahead of
+  // an earlier one in drain order. Clamping such an inversion to zero would make
+  // the host's reconstructed clock drift permanently ahead of the device's
+  // (§19.10). Zigzag encoding costs no extra byte at the magnitudes seen here.
+  //
+  // Declared 64-bit so that an idle stream cannot overflow it.
+  sint64 timestamp_ticks = 1;
+
+  // Dictionary key assigned by NAME_REGISTERED. Id 0 is reserved for "unknown",
+  // emitted when the registry is full (§5.5, REQ-T11).
+  uint32 name_id = 2;
+
+  TraceEventType event_type = 3;
+
+  // Wraps at 16384 (see SEQUENCE_MODULUS). The counter exists only to detect
+  // gaps, which are read modulo the wrap, so a full 32-bit counter would spend
+  // up to five varint bytes to buy nothing (§18.1).
+  uint32 sequence = 4;
+
+  // MARKER only.
+  optional uint32 marker_value = 5;
+
+  // ── NAME_REGISTERED only: the dictionary entry (§6.2) ────────────────────
+  string name = 6;
+  TraceEventSourceType source_type = 7;
+  uint32 priority = 8;
+  optional float relative_deadline_ms = 9;
+
+  // ── TRACE_START only (§6.3) ──────────────────────────────────────────────
+  TimeBase timebase = 10;
+  // Core clock in Hz, for converting CYCLES ticks to wall time. Unset when the
+  // timebase is NANOSECONDS.
+  uint32 core_frequency_hz = 11;
+  // The source mask active in this build (§5.4), so the host can tell a masked
+  // group from a silent one without hard-coding the mask (REQ-T05).
+  uint32 source_mask = 12;
 }
 
 enum TraceEventSourceType {
@@ -23,4 +68,17 @@ enum TraceEventType {
   SPAN_START = 1;
   SPAN_END = 2;
   MARKER = 3;
+  NAME_REGISTERED = 4;
+  TRACE_START = 5;
+}
+
+// The unit of `timestamp_ticks`, declared once on the TRACE_START frame.
+//
+// Increment 6 emits NANOSECONDS; increment 7 (§5.8) switches the firmware to a
+// raw DWT cycle counter and emits CYCLES with `core_frequency_hz` set. Declaring
+// the unit on the wire keeps that a firmware change rather than a second
+// incompatible schema.
+enum TimeBase {
+  NANOSECONDS = 0;
+  CYCLES = 1;
 }

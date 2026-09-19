@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/erl987/execution-trace"
 keywords = ["embedded", "tracing", "no_std", "profiling", "rtos"]
 categories = ["development-tools::profiling", "embedded", "no-std"]
-include = ["/src/**", "/proto/**", "/build.rs", "/examples/simulate.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+include = ["/src/**", "/proto/**", "/build.rs", "/examples/simulate.rs", "/README.md", "/CHANGELOG.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [lints.clippy]
 unwrap_used = "deny"
@@ -23,7 +23,7 @@ enabled = ["dep:heapless", "dep:micropb"]
 std = []
 
 [dependencies]
-heapless = { version = "0.9.2", optional = true }
+heapless = { version = "0.9.3", optional = true }
 micropb = { version = "0.6.0", default-features = false, features = ["encode", "decode", "container-heapless-0-9", "enable-64bit"], optional = true }
 
 [build-dependencies]
