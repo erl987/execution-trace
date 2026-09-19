@@ -23,7 +23,7 @@ enabled = ["dep:heapless", "dep:micropb"]
 std = []
 
 [dependencies]
-heapless = { version = "0.9.2", optional = true }
+heapless = { version = "0.9.3", optional = true }
 micropb = { version = "0.6.0", default-features = false, features = ["encode", "decode", "container-heapless-0-9", "enable-64bit"], optional = true }
 
 [build-dependencies]
