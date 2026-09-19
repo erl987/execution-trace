@@ -109,7 +109,7 @@ is why the buffer is [`encode::MAX_TRACE_BURST_SIZE`] rather than one frame.
 ### 4. Decode on the host
 
 A frame is not self-contained: its name is a dictionary id and its timestamp is a delta against
-the previous frame. [`decode_trace_frame`] therefore returns a [`RawTraceFrame`], and the reader
+the previous frame. [`encode::decode_trace_frame`] therefore returns a [`RawTraceFrame`], and the reader
 resolves both from state it carries across the stream:
 
 ```rust,ignore

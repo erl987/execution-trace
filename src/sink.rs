@@ -52,11 +52,14 @@ pub trait TraceTransport {
 /// `TraceSink` operates in two layers:
 ///
 /// 1. **Recording layer** — `record_span_start`, `record_span_end`, and `record_marker`
-///    read the hardware clock via `now_ticks`, construct [`TraceEvent`]s
-///    (sequence left at zero), and hand them to [`TraceTransport::write_event`].
-/// 2. **Transport layer** — code that owns the wire (e.g. [`crate::SequenceEncoder`]) injects a
-///    monotonic sequence counter before writing bytes to RTT, UART, etc. The sequence
-///    allows the host decoder to detect dropped frames.
+///    read the hardware clock via `now_ticks`, construct [`TraceEvent`]s, stamp each
+///    with [`next_sequence`](crate::next_sequence), and hand them to
+///    [`TraceTransport::write_event`]. Numbering happens here rather than at the wire
+///    so that an event dropped on the way to the transport still leaves a gap the host
+///    can see.
+/// 2. **Transport layer** — code that owns the wire (e.g. [`TraceEncoder`](crate::TraceEncoder))
+///    turns each event into frames and writes the bytes to RTT, UART, etc., carrying the
+///    sequence through unchanged.
 ///
 /// For tests or placeholders, use [`NoopSink`], which discards all events at zero cost.
 #[cfg(feature = "enabled")]
