@@ -1,4 +1,4 @@
-//! Wire encoding for the v2 trace format (EXEC-TRACE-002 §6).
+//! Wire encoding for the v2 trace format.
 //!
 //! Every frame is `[varint: byte length][protobuf-encoded TraceFrame]`, and every
 //! frame class — the three per-occurrence events, the dictionary entry and the
@@ -19,13 +19,7 @@ pub const MAX_TRACE_FRAME_SIZE: usize = 128;
 /// frame ahead of the event when a name is seen for the first time.
 pub const MAX_TRACE_BURST_SIZE: usize = 2 * MAX_TRACE_FRAME_SIZE;
 
-/// Distinct names the dictionary holds, against 27 in the firmware today.
-///
-/// Sized close to that count on purpose. Each entry is ~52 B, so this array is
-/// the single largest thing the trace format puts in RAM — and under flip-link
-/// every byte of it comes out of the stack, which EXEC-TRACE-002 §23 found had
-/// no room left to give. Raising it is not free; `TracingNameRegistryFull` and
-/// `UNKNOWN_NAME_ID` (REQ-T11) are what guard the other side.
+/// Distinct names the dictionary holds
 pub const NAME_REGISTRY_CAPACITY: usize = 40;
 
 /// The reserved "unknown" name id, emitted when the registry is full (REQ-T11).

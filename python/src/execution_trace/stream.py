@@ -43,7 +43,7 @@ class SequenceTracker:
         With a *reorder_window* above zero the tracker tolerates frames arriving
         slightly out of order before calling a hole loss. The execution-trace v2
         format needs this: a frame is numbered by its producer, before it reaches
-        the queue the transport drains (EXEC-TRACE-002 §5.7), so an ISR that
+        the queue the transport drains, so an ISR that
         preempts a task between those two points takes a later number and reaches
         the wire first. The transport's own frames — the stream header and the
         dictionary — are numbered when written and can likewise overtake events

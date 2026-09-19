@@ -56,7 +56,7 @@ UNKNOWN_NAME: str = "<unknown>"
 SEEN_HISTORY: int = 512
 
 # How far a frame may arrive ahead of a missing one before that one is called
-# lost (EXEC-TRACE-002 §5.7, §19.12).
+# lost.
 #
 # Frames are numbered by their producer, before the queue the transport drains,
 # so an ISR preempting a task between those two points takes a later number and
@@ -108,7 +108,7 @@ class TraceEvent:
 
 @dataclass
 class GapRecord:
-    """A stretch of the trace where frames were lost (EXEC-TRACE-002 §5.9).
+    """A stretch of the trace where frames were lost.
 
     Emitted as a row of its own so that missing data *looks* missing. Silent
     truncation is what made a 2 % frame-loss rate read as a broken instrument

@@ -49,7 +49,7 @@ impl TraceEvent {
     ///
     /// Zero until [`set_sequence`] is called; the transport forwards whatever is
     /// here rather than numbering the event itself, so that a frame lost between
-    /// the recording layer and the wire still leaves a gap (EXEC-TRACE-002 §5.7).
+    /// the recording layer and the wire still leaves a gap.
     ///
     /// [`set_sequence`]: TraceEvent::set_sequence
     #[must_use]

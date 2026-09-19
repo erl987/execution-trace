@@ -71,7 +71,7 @@ pub trait TraceSink: TraceTransport {
     /// [`TraceEncoder::with_cycle_counter`]. A cycle source may be a
     /// free-running 32-bit counter returned widened: the encoder extends it, so
     /// that this can be a single volatile load with no critical section and no
-    /// division on the path an ISR takes (EXEC-TRACE-002 §5.8).
+    /// division on the path an ISR takes.
     ///
     /// This method has no default — every `TraceSink` implementor must wire up a real clock
     /// source. Returning a constant `0` is valid for stubs, but must be done explicitly to

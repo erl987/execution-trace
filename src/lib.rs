@@ -9,7 +9,7 @@
 #[cfg(feature = "enabled")]
 pub mod encode;
 
-/// The producer-side sequence counter (EXEC-TRACE-002 §5.7).
+/// The producer-side sequence counter.
 ///
 /// Numbering at record time rather than in the transport is what makes loss at
 /// the producer queue visible: a frame dropped there has already burned a

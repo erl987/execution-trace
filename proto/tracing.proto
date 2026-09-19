@@ -1,7 +1,7 @@
 syntax = "proto3";
 package tracing;
 
-// Execution-trace wire format v2 (EXEC-TRACE-002 §6).
+// Execution-trace wire format v2.
 //
 // Not wire-compatible with v1. A v2 stream is recognised by its leading
 // TRACE_START frame; see §6.4.

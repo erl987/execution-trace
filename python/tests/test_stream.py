@@ -257,8 +257,7 @@ class TestSequenceTrackerReordering:
     def test_a_window_does_not_hide_a_device_reset(self, caplog):
         # Detectable only when the pre-reset counter was low in the range: from
         # high in it a restart at zero is indistinguishable from a forward gap,
-        # which is why the trace decoder leans on TRACE_START instead
-        # (EXEC-TRACE-002 §19.6).
+        # which is why the trace decoder leans on TRACE_START instead.
         t = self._tracker()
         with caplog.at_level(logging.WARNING, logger="execution_trace.stream"):
             t.observe(10)
