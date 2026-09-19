@@ -8,7 +8,7 @@ The Rust crate this package decodes for ships from the same repository as
 [`execution-trace`](../CHANGELOG.md) and is released from the same tag, so the two
 version numbers move together.
 
-## [Unreleased] — next release is 0.2.0
+## [0.2.0] - 2026-09-19
 
 **A breaking release.** This decodes the v2 wire format and **cannot decode a v1 stream**,
 which is what `execution-trace` 0.1.x firmware emits; 0.1.x of this package cannot decode

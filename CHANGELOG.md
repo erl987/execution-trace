@@ -8,7 +8,7 @@ The Python decoder ships from this repository as
 [`embedded-etrace`](python/CHANGELOG.md) and is released from the same tag, so the two
 version numbers move together.
 
-## [Unreleased] — next release is 0.2.0
+## [0.2.0] - 2026-09-19
 
 **A breaking release.** The wire format is v2 and is not compatible with the v1 format
 0.1.x produced: a firmware built on 0.2.0 needs `embedded-etrace` 0.2.0 on the host, and
