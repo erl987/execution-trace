@@ -714,7 +714,10 @@ fn from_proto(p: crate::proto::tracing_::TraceFrame) -> Option<RawTraceFrame> {
     })
 }
 
+// `unwrap` and `panic!` are how a test asserts. The crate denies both because a
+// firmware panic is a hard fault, which is not a risk a test harness runs.
 #[cfg(all(test, feature = "std", feature = "enabled"))]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use heapless::String;
@@ -1220,7 +1223,6 @@ mod tests {
     #[test]
     fn cycle_deltas_reconstruct_the_elapsed_time_across_a_wrap() {
         let mut enc = TraceEncoder::with_cycle_counter(72_000_000);
-        let mut buf = [0u8; MAX_TRACE_BURST_SIZE];
         let mut wire = Vec::new();
         // 100 steps of 1 000 000 cycles, starting just before the rollover.
         let mut raw = u32::MAX - 50_000_000;
@@ -1255,7 +1257,6 @@ mod tests {
         let mut enc = TraceEncoder::new();
         let mut buf = [0u8; MAX_TRACE_FRAME_SIZE];
         let ns = enc.encode_trace_start(0, 0, &mut buf).unwrap();
-        let mut enc = TraceEncoder::new();
         let mut enc = TraceEncoder::with_cycle_counter(72_000_000);
         let cycles = enc.encode_trace_start(0, 0, &mut buf).unwrap();
         assert!(cycles > ns);

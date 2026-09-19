@@ -256,7 +256,10 @@ impl TraceSink for NoopSink {
 #[cfg(not(feature = "enabled"))]
 impl TraceSink for NoopSink {}
 
+// `unwrap` and `panic!` are how a test asserts. The crate denies both because a
+// firmware panic is a hard fault, which is not a risk a test harness runs.
 #[cfg(all(test, feature = "std", feature = "enabled"))]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 

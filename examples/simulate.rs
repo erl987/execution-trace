@@ -162,8 +162,8 @@ fn main() -> std::io::Result<()> {
     // resolve them. This is the same job the Python decoder does.
     println!("\nDecoded events:");
     println!(
-        "{:<6} {:<14} {:<12} {:<10} {:<8} {}",
-        "seq", "name", "type", "source", "ts_ms", "extras"
+        "{:<6} {:<14} {:<12} {:<10} {:<8} extras",
+        "seq", "name", "type", "source", "ts_ms"
     );
     println!("{}", "-".repeat(72));
 
