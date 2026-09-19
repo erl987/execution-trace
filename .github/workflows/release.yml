@@ -37,6 +37,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      # The same gate the Python workflow applies on every push, repeated here:
+      # PyPI has no unpublish, so the upload below must not be the first time
+      # the tests are run against what is being shipped.
+      - run: pip install -e "python/.[diagram,dev]"
+      - run: pytest python/tests/ -v
+      - run: mypy python/src/execution_trace
       - run: pip install build
       - run: python -m build python/
       - uses: pypa/gh-action-pypi-publish@release/v1
